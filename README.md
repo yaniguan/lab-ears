@@ -1,6 +1,6 @@
 # lab-ears
 
-Teach a lab agent to *listen*: turn spoken goals, written protocols and instrument logs into clear, checkable steps.
+Teach a lab agent to *listen*: turn spoken goals, written protocols and instrument logs into clear, checkable steps, and notice when a machine sounds wrong.
 
 ## Where it fits
 
@@ -28,6 +28,67 @@ Speed          155   182    0.692    0.813    0.748      0.747
 
 Plain rules already get F1 0.75-0.91 on these four number-like slots. Actions, reagents and the links between them are not tested yet; that is the next step, with a learned parser. Speech input (for example a small Whisper model) comes after that.
 
+## Machine sounds
+
+Instruments often sound wrong before they fail: a worn bearing grinds, an unbalanced rotor knocks, a pump stalls. `acoustic/` learns what normal sounds like for one machine and flags clips that do not fit. It never sees an anomaly in training.
+
+- Features: 64-bin log-mel spectrogram (16 kHz, 1024-point FFT, hop 512), numpy and scipy only.
+- Detectors: `gaussian` (Mahalanobis distance of the clip's per-bin mean and std), `knn` (mean distance to the 5 nearest normal clips), `autoencoder` (dense 128-128-8-128-128 on 5 stacked frames; score is the reconstruction error).
+- Data: three machines (fan, valve, bearing) from the [DCASE 2023 Task 2 development set](https://zenodo.org/records/7882613) (CC BY 4.0). Per machine: 1000 normal training clips (990 source domain, 10 target domain), 200 test clips of 10 s. The script downloads them; no audio is in this repo.
+
+```bash
+pip install -r acoustic/requirements.txt
+python -m acoustic.fetch_dcase2023 --machines fan valve bearing   # about 850 MB
+python -m acoustic.evaluate --machines fan valve bearing
+python -m pytest -q tests/test_acoustic.py                        # synthetic clips, no download
+```
+
+Measured (Linux, Intel Xeon CPU, one thread, 2026-11-18; full output in `results/dcase2023_cpu.json`). AUC per domain and pAUC (max FPR 0.1), as in the DCASE rules:
+
+| Machine | Detector | AUC source | AUC target | pAUC | Fit time | Latency per 10 s clip (median / p95) |
+|---|---|---:|---:|---:|---:|---:|
+| fan | gaussian | 0.475 | 0.499 | 0.551 | 0.1 s | 5.3 / 6.7 ms |
+| fan | knn | 0.402 | 0.461 | 0.517 | 0.1 s | 4.0 / 4.4 ms |
+| fan | autoencoder | 0.719 | 0.498 | 0.584 | 19.1 s | 5.7 / 17.9 ms |
+| valve | gaussian | 0.686 | 0.527 | 0.502 | 0.1 s | 2.9 / 7.1 ms |
+| valve | knn | 0.586 | 0.453 | 0.491 | 0.1 s | 2.9 / 5.4 ms |
+| valve | autoencoder | 0.576 | 0.449 | 0.524 | 18.3 s | 3.3 / 4.0 ms |
+| bearing | gaussian | 0.689 | 0.543 | 0.542 | 0.1 s | 2.8 / 3.3 ms |
+| bearing | knn | 0.662 | 0.512 | 0.523 | 0.1 s | 2.9 / 3.0 ms |
+| bearing | autoencoder | 0.706 | 0.514 | 0.533 | 19.8 s | 3.3 / 7.2 ms |
+
+Latency covers reading the WAV file, the log-mel and the score. Harmonic mean of the nine numbers per detector: autoencoder 0.555, gaussian 0.548, knn 0.502.
+
+What this says:
+
+- This is a hard set on purpose: few target-domain clips and unseen anomaly types. Target-domain AUC is near chance (0.45-0.54) for every detector here.
+- For scale, the official DCASE 2023 autoencoder baseline (MSE mode, 5 GPU runs) reports AUC source / target / pAUC of 0.802 / 0.362 / 0.590 on fan, 0.554 / 0.507 / 0.512 on valve and 0.659 / 0.558 / 0.504 on bearing ([task page](https://dcase.community/challenge2023/task-first-shot-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring)). Our autoencoder is in the same range.
+- Scoring is fast enough for live use (under 20 ms per 10 s clip on one CPU thread). Detection quality is the open problem; pretrained audio embeddings with kNN are the next thing to try.
+- These are factory and toy machines, not lab instruments. Lab use needs our own normal recordings per instrument.
+
+### Privacy
+
+Lab audio can catch people talking. By default:
+
+- Raw audio is not stored. Only log-mel features (and the score) are kept.
+- `--speech-band drop` (or `log_mel(..., drop_speech_band=True)`) removes mel bins centred between 300 and 3400 Hz, where most speech energy is, keeping only the machine band. With the band dropped, the harmonic mean becomes autoencoder 0.496, gaussian 0.523, knn 0.487 (same file), so it costs some accuracy.
+- A contact microphone or vibration sensor on the instrument picks up much less speech than a room microphone.
+
+Log-mel features are not a guarantee: coarse speech content may still be recoverable from them. Tell people in the room that machines are being recorded.
+
+### Audio event record
+
+`acoustic/record.py` writes one JSON line per scored clip, ready to join the run ledger:
+
+```json
+{"schema": "lab-ears/audio-event/v1", "protocol_id": "pcr-setup-v2", "step": 4,
+ "instrument_id": "centrifuge-01", "start_utc": "2026-11-18T09:58:12.031Z", "duration_s": 10.0,
+ "sample_rate_hz": 16000, "mic": "contact", "detector": "gaussian", "score": 12.5, "threshold": 10.0,
+ "flagged": true, "features_path": null, "speech_band_dropped": true, "raw_audio_kept": false, "notes": ""}
+```
+
+The timestamp, protocol id and step tie each sound to the step that was running, so a flagged clip can pause the run or explain a failed one later. The example values are made up.
+
 ## Datasets
 
 | Dataset | What | License |
@@ -37,6 +98,8 @@ Plain rules already get F1 0.75-0.91 on these four number-like slots. Actions, r
 | [BioProBench](https://huggingface.co/datasets/BioProBench/BioProBench) | Protocol QA, step ordering, error correction, generation | CC BY-NC 4.0 (**non-commercial**) |
 | [LAB-Bench](https://huggingface.co/datasets/futurehouse/lab-bench) | Biology research tasks incl. ProtocolQA | CC BY-SA 4.0 |
 | [protocols.io](https://www.protocols.io/) | Large open protocol repository | Per protocol, often CC BY - check each |
+| [DCASE 2023 Task 2 dev](https://zenodo.org/records/7882613) | Normal and anomalous machine sounds, 7 machine types, domain shift | CC BY 4.0 |
+| [MIMII](https://zenodo.org/records/3384388) | Pump, fan, valve, slide-rail sounds at three noise levels (7-11 GB per file) | CC BY-SA 4.0 |
 | [LibriSpeech](https://www.openslr.org/12) | ~1000 h read English speech for ASR | CC BY 4.0 |
 | [Common Voice](https://commonvoice.mozilla.org/) | Crowd-sourced multilingual speech | CC0 |
 
