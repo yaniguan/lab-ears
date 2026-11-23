@@ -89,6 +89,35 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 | 2026-08-03 | [ProtoAct: Turning Wet-Lab Protocols into Embodied Robotic Actions](https://arxiv.org/abs/2608.01690) | ProtoAct: turns free-form wet-lab protocols into state-aware robot action sequences. |
 | 2025-05-11 | [BioProBench: A Corpus and Benchmark for Biological Protocol Reasoning in Autonomous Science](https://arxiv.org/abs/2505.07889) | BioProBench: 22,413 human-written protocols and 523,784 task instances; models do well on comprehension but drop on deep reasoning, quantities and safety. |
 
+## System Profile: Object · Data · Model · Training · History · Unique Properties
+
+`lab-ears` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L2 · Auditory & Protocol Sensory Cortex`**.
+
+- **Object**: Sensory ingestion layer that extracts quantitative parameters (`Amount`, `Temperature`, `Time`, `Speed`) from wet-lab protocol prose (`main`) and monitors benchtop machine audio for unsupervised acoustic anomalies with speech-band privacy filtering (`origin/acoustic-anomaly`).
+- **Data**: Wet Lab Protocols (WLP) 125-protocol BRAT test split (MIT) on `main`; DCASE 2023 Task 2 `16 kHz` machine audio (`fan`, `valve`, `bearing`, CC BY 4.0) and `lab-ears/audio-event/v1` JSONL ledger schema on `origin/acoustic-anomaly`.
+- **Model**: Stdlib regex span extractor with `Speed`-over-`Amount` span disambiguation (`demo/parse_protocol.py`); 64-bin HTK log-mel frontend (`300–3400 Hz` speech-band mask) paired with Ledoit-Wolf `GaussianDetector`, `KNNDetector(k=5)`, and 5-frame `AutoencoderDetector` (`128-128-8-128-128`).
+- **Training**: Rule-based zero-parameter baseline on WLP (`0.748–0.907` exact F1); strictly one-class normal-only fitting (`1,000` clips/machine) on DCASE 2023 (`0.555` fullband / `0.496` speech-dropped harmonic mean for autoencoder).
+- **History**: `ba743be` (2026-11-18, `main` WLP protocol parser & curated resources) -> `5476541` (2026-11-18, `origin/acoustic-anomaly` DCASE 2023 acoustic baseline & privacy event schema).
+- **Unique Properties**: Zero external dependencies on `main`, `< 6 ms` median single-thread CPU latency per `10 s` WAV clip, and enforced speech-band/raw-audio privacy validation in `AudioEvent.validate()`.
+
+Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
+
+## Repository Layout
+
+```text
+lab-ears/
+├── .github/workflows/
+│   └── demo.yml                  # CI workflow cloning WLP-Dataset and running protocol parser
+├── demo/
+│   ├── parse_protocol.py         # Zero-dependency regex extractor & WLP BRAT evaluator
+│   └── output.txt                # Reference WLP test-split metrics (125 protocols)
+├── docs/
+│   └── ARCHITECTURE_AND_HISTORY.md
+├── LICENSE                       # MIT License
+├── README.md                     # Overview, benchmarks, curated datasets, repos, and papers
+└── requirements.txt              # Standard library only on main (acoustic/ added in PR branch)
+```
+
 ## Contributing
 
 Found a broken link or a missing dataset, repo or paper? Open an issue or a pull request.
