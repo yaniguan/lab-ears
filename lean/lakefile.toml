@@ -1,0 +1,6 @@
+name = "labearslean"
+version = "0.1.0"
+defaultTargets = ["LabEarsLean"]
+
+[[lean_lib]]
+name = "LabEarsLean"
