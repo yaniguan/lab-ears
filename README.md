@@ -1,6 +1,6 @@
 # lab-ears
 
-Teach a lab agent to *listen*: turn spoken goals, written protocols and instrument logs into clear, checkable steps.
+Teach a lab agent to *listen*: turn spoken goals, written protocols and instrument logs into clear, checkable steps, and notice when a machine sounds wrong.
 
 ## Where it fits
 
@@ -8,25 +8,87 @@ In the lab agent on [yaniguan.github.io](https://yaniguan.github.io/), the ears 
 
 ## First attempt
 
-A rule-based baseline (regular expressions, no learning) that finds **Amount, Temperature, Time and Speed** spans in wet-lab protocols, scored against the gold labels of the Wet Lab Protocols corpus test split (125 protocols). `P_overlap` counts a predicted span as right if it overlaps a gold span of the same type.
+A rule-based baseline (regular expressions, no learning) that finds **Amount, Temperature, Time and Speed** spans in wet-lab protocols, normalizes them into canonical Auto-Lab units (`parse_quantities()`), and scores them against the gold labels of the Wet Lab Protocols corpus test split (125 protocols, commit `1f51ae6e620a5aa3590acf725713f430783f56d7`). Overlap metrics (`P_overlap`, `R_overlap`, `F1_overlap`) use 1-to-1 maximum bipartite matching.
 
 ```bash
-git clone --depth 1 https://github.com/chaitanya2334/WLP-Dataset data/WLP-Dataset
-python demo/parse_protocol.py data/WLP-Dataset/test
+git clone https://github.com/chaitanya2334/WLP-Dataset data/WLP-Dataset
+git -C data/WLP-Dataset checkout 1f51ae6e620a5aa3590acf725713f430783f56d7
+python demo/parse_protocol.py data/WLP-Dataset/test --min-f1 0.78
 ```
 
-Output (Linux, CPU only, 2026-11-18):
+Output (CPU only, re-measured against pinned WLP test split):
 
 ```
-protocols: 125
-label         gold  pred  P_exact  R_exact F1_exact  P_overlap
-Amount        1011  1103    0.756    0.825    0.789      0.773
-Temperature    509   584    0.724    0.831    0.774      0.839
-Time           810   806    0.909    0.905    0.907      0.940
-Speed          155   182    0.692    0.813    0.748      0.747
+protocols: 125 (discontinuous_gold: 2, skipped_discontinuous: 0)
+label           gold  pred  P_exact  R_exact F1_exact  P_overlap  R_overlap F1_overlap
+Amount          1013  1132    0.756    0.845    0.798      0.777      0.869      0.821
+Temperature      509   583    0.799    0.916    0.853      0.851      0.974      0.908
+Time             812   801    0.915    0.903    0.909      0.944      0.931      0.937
+Speed            155   146    0.863    0.813    0.837      0.932      0.877      0.904
 ```
 
-Plain rules already get F1 0.75-0.91 on these four number-like slots. Actions, reagents and the links between them are not tested yet; that is the next step, with a learned parser. Speech input (for example a small Whisper model) comes after that.
+Plain rules reach exact F1 0.80-0.91 (overlap F1 0.82-0.94) on these four number-like slots. Actions, reagents and the links between them are not tested yet; that is the next step, with a learned parser. Speech input (for example a small Whisper model) comes after that.
+
+## Machine sounds
+
+Instruments often sound wrong before they fail: a worn bearing grinds, an unbalanced rotor knocks, a pump stalls. `acoustic/` learns what normal sounds like for one machine and flags clips that do not fit. It never sees an anomaly in training.
+
+- Features: 64-bin log-mel spectrogram (16 kHz, 1024-point FFT, hop 512), numpy and scipy only.
+- Detectors: `gaussian` (Mahalanobis distance of the clip's per-bin mean and std), `knn` (mean distance to the 5 nearest normal clips), `autoencoder` (dense 128-128-8-128-128 on 5 stacked frames; score is the reconstruction error).
+- Data: three machines (fan, valve, bearing) from the [DCASE 2023 Task 2 development set](https://zenodo.org/records/7882613) (CC BY 4.0). Per machine: 1000 normal training clips (990 source domain, 10 target domain), 200 test clips of 10 s. The script downloads them; no audio is in this repo.
+
+```bash
+pip install -r acoustic/requirements.txt
+python -m acoustic.fetch_dcase2023 --machines fan valve bearing   # about 850 MB
+python -m acoustic.evaluate --machines fan valve bearing
+python -m pytest -q tests/test_acoustic.py                        # synthetic clips, no download
+```
+
+Measured (Linux, Intel Xeon CPU, one thread, 2026-11-18; full output in `results/dcase2023_cpu.json`). AUC per domain and pAUC (max FPR 0.1), as in the DCASE rules:
+
+| Machine | Detector | AUC source | AUC target | pAUC | Fit time | Latency per 10 s clip (median / p95) |
+|---|---|---:|---:|---:|---:|---:|
+| fan | gaussian | 0.475 | 0.499 | 0.551 | 0.1 s | 5.3 / 6.7 ms |
+| fan | knn | 0.402 | 0.461 | 0.517 | 0.1 s | 4.0 / 4.4 ms |
+| fan | autoencoder | 0.719 | 0.498 | 0.584 | 19.1 s | 5.7 / 17.9 ms |
+| valve | gaussian | 0.686 | 0.527 | 0.502 | 0.1 s | 2.9 / 7.1 ms |
+| valve | knn | 0.586 | 0.453 | 0.491 | 0.1 s | 2.9 / 5.4 ms |
+| valve | autoencoder | 0.576 | 0.449 | 0.524 | 18.3 s | 3.3 / 4.0 ms |
+| bearing | gaussian | 0.689 | 0.543 | 0.542 | 0.1 s | 2.8 / 3.3 ms |
+| bearing | knn | 0.662 | 0.512 | 0.523 | 0.1 s | 2.9 / 3.0 ms |
+| bearing | autoencoder | 0.706 | 0.514 | 0.533 | 19.8 s | 3.3 / 7.2 ms |
+
+Latency covers reading the WAV file, the log-mel and the score. Harmonic mean of the nine numbers per detector: autoencoder 0.555, gaussian 0.548, knn 0.502.
+
+What this says:
+
+- This is a hard set on purpose: few target-domain clips and unseen anomaly types. Target-domain AUC is near chance (0.45-0.54) for every detector here.
+- For scale, the official DCASE 2023 autoencoder baseline (MSE mode, 5 GPU runs) reports AUC source / target / pAUC of 0.802 / 0.362 / 0.590 on fan, 0.554 / 0.507 / 0.512 on valve and 0.659 / 0.558 / 0.504 on bearing ([task page](https://dcase.community/challenge2023/task-first-shot-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring)). Our autoencoder is in the same range.
+- Scoring is fast enough for live use (under 20 ms per 10 s clip on one CPU thread). Detection quality is the open problem; pretrained audio embeddings with kNN are the next thing to try.
+- These are factory and toy machines, not lab instruments. Lab use needs our own normal recordings per instrument.
+
+### Privacy
+
+Lab audio can catch people talking. By default:
+
+- Raw audio is not stored. Only log-mel features (and the score) are kept.
+- `--speech-band drop` (or `log_mel(..., drop_speech_band=True)`) removes every mel filter whose non-zero frequency support `[lo_hz, hi_hz]` overlaps `(300, 3400) Hz`, where speech energy sits, keeping only the machine band (`<= 300 Hz` and `>= 3400 Hz`). In the initial center-frequency DCASE run (`results/dcase2023_cpu.json`), dropping the speech band shifted the harmonic mean to autoencoder 0.496, gaussian 0.523, knn 0.487.
+- A contact microphone or vibration sensor on the instrument picks up much less speech than a room microphone.
+
+Log-mel features are not a guarantee: coarse speech content may still be recoverable from them. Tell people in the room that machines are being recorded.
+
+### Audio event record
+
+`acoustic/record.py` writes one JSON line per scored clip, ready to join the run ledger:
+
+```json
+{"schema": "lab-ears/audio-event/v1", "protocol_id": "pcr-setup-v2", "step": 4,
+ "instrument_id": "centrifuge-01", "start_utc": "2026-11-18T09:58:12.031Z", "duration_s": 10.0,
+ "sample_rate_hz": 16000, "mic": "contact", "detector": "gaussian", "score": 12.5, "threshold": 10.0,
+ "flagged": true, "features_path": null, "speech_band_dropped": true, "raw_audio_kept": false, "notes": ""}
+```
+
+The timestamp, protocol id and step tie each sound to the step that was running, so a flagged clip can pause the run or explain a failed one later (`python -m acoustic.monitor --train-dir ... --wav ... --out-jsonl ...` calibrates normal thresholds via `calibrate_threshold()` and appends validated JSONL lines). The example values above are illustrative.
 
 ## Datasets
 
@@ -37,6 +99,8 @@ Plain rules already get F1 0.75-0.91 on these four number-like slots. Actions, r
 | [BioProBench](https://huggingface.co/datasets/BioProBench/BioProBench) | Protocol QA, step ordering, error correction, generation | CC BY-NC 4.0 (**non-commercial**) |
 | [LAB-Bench](https://huggingface.co/datasets/futurehouse/lab-bench) | Biology research tasks incl. ProtocolQA | CC BY-SA 4.0 |
 | [protocols.io](https://www.protocols.io/) | Large open protocol repository | Per protocol, often CC BY - check each |
+| [DCASE 2023 Task 2 dev](https://zenodo.org/records/7882613) | Normal and anomalous machine sounds, 7 machine types, domain shift | CC BY 4.0 |
+| [MIMII](https://zenodo.org/records/3384388) | Pump, fan, valve, slide-rail sounds at three noise levels (7-11 GB per file) | CC BY-SA 4.0 |
 | [LibriSpeech](https://www.openslr.org/12) | ~1000 h read English speech for ASR | CC BY 4.0 |
 | [Common Voice](https://commonvoice.mozilla.org/) | Crowd-sourced multilingual speech | CC0 |
 
@@ -93,12 +157,12 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 
 `lab-ears` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L2 · Auditory & Protocol Sensory Cortex`**.
 
-- **Object**: Sensory ingestion layer that extracts quantitative parameters (`Amount`, `Temperature`, `Time`, `Speed`) from wet-lab protocol prose (`main`) and monitors benchtop machine audio for unsupervised acoustic anomalies with speech-band privacy filtering (`origin/acoustic-anomaly`).
-- **Data**: Wet Lab Protocols (WLP) 125-protocol BRAT test split (MIT) on `main`; DCASE 2023 Task 2 `16 kHz` machine audio (`fan`, `valve`, `bearing`, CC BY 4.0) and `lab-ears/audio-event/v1` JSONL ledger schema on `origin/acoustic-anomaly`.
-- **Model**: Stdlib regex span extractor with `Speed`-over-`Amount` span disambiguation (`demo/parse_protocol.py`); 64-bin HTK log-mel frontend (`300–3400 Hz` speech-band mask) paired with Ledoit-Wolf `GaussianDetector`, `KNNDetector(k=5)`, and 5-frame `AutoencoderDetector` (`128-128-8-128-128`).
-- **Training**: Rule-based zero-parameter baseline on WLP (`0.748–0.907` exact F1); strictly one-class normal-only fitting (`1,000` clips/machine) on DCASE 2023 (`0.555` fullband / `0.496` speech-dropped harmonic mean for autoencoder).
-- **History**: `ba743be` (2026-11-18, `main` WLP protocol parser & curated resources) -> `5476541` (2026-11-18, `origin/acoustic-anomaly` DCASE 2023 acoustic baseline & privacy event schema).
-- **Unique Properties**: Zero external dependencies on `main`, `< 6 ms` median single-thread CPU latency per `10 s` WAV clip, and enforced speech-band/raw-audio privacy validation in `AudioEvent.validate()`.
+- **Object**: Sensory ingestion layer that extracts and normalizes quantitative parameters (`Amount`, `Temperature`, `Time`, `Speed`, plus optional `Concentration`) from wet-lab protocol prose and monitors benchtop machine audio for unsupervised acoustic anomalies with speech-band privacy filtering.
+- **Data**: Wet Lab Protocols (WLP) 125-protocol BRAT test split (MIT, pinned at `1f51ae6e620a5aa3590acf725713f430783f56d7`); DCASE 2023 Task 2 `16 kHz` machine audio (`fan`, `valve`, `bearing`, CC BY 4.0, MD5-verified Zenodo record `7882613`) and `lab-ears/audio-event/v1` JSONL ledger schema.
+- **Model**: Stdlib regex span extractor with contextual `Speed`-vs-`Amount` mass disambiguation, canonical unit normalizer (`parse_quantities`), and 1-to-1 bipartite overlap scorer (`demo/parse_protocol.py`); 64-bin HTK log-mel frontend (strict `[lo_hz, hi_hz]` `300–3400 Hz` speech-band filter exclusion) paired with unsquared Mahalanobis Ledoit-Wolf `GaussianDetector`, few-shot-safe `KNNDetector(k=5)`, and 5-frame `AutoencoderDetector` (`128-128-8-128-128`).
+- **Training**: Rule-based zero-parameter baseline on WLP (`0.798–0.909` exact F1, `0.821–0.937` overlap F1); strictly one-class normal-only fitting (`1,000` clips/machine) on DCASE 2023 (`0.555` fullband / `0.496` speech-dropped harmonic mean for autoencoder) plus quantile threshold calibration (`calibrate_threshold`).
+- **History**: `ba743be` (2026-11-18, `main` WLP protocol parser & curated resources) -> `5476541` (2026-11-18, `acoustic-anomaly` DCASE 2023 acoustic baseline & privacy event schema) -> merged and hardened with full offline test coverage, canonical quantity normalization, and live `acoustic.monitor` JSONL emission.
+- **Unique Properties**: Zero external runtime dependencies for `demo/parse_protocol.py`, `< 6 ms` median single-thread CPU latency per `10 s` WAV clip, dtype-exact PCM normalization, Zip-Slip/MD5-verified dataset fetching, and strict finite/timezone/privacy validation in `AudioEvent.validate()`.
 
 Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
 
@@ -107,15 +171,30 @@ Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITEC
 ```text
 lab-ears/
 ├── .github/workflows/
-│   └── demo.yml                  # CI workflow cloning WLP-Dataset and running protocol parser
+│   └── demo.yml                  # CI workflow: offline pytest, cached pinned WLP-Dataset, F1 gate
+├── acoustic/
+│   ├── __init__.py               # Public acoustic anomaly & monitoring exports
+│   ├── detect.py                 # Gaussian, kNN, Autoencoder detectors & calibrate_threshold()
+│   ├── evaluate.py               # Single-thread DCASE 2023 Task 2 benchmark runner
+│   ├── features.py               # Dtype-aware WAV loader, zero-copy log-mel, speech-band mask
+│   ├── fetch_dcase2023.py        # Timeout + MD5 + Zip-Slip-guarded Zenodo downloader
+│   ├── monitor.py                # CLI/API emitting calibrated AudioEvent JSONL lines
+│   ├── record.py                 # Validated lab-ears/audio-event/v1 ledger schema
+│   └── requirements.txt          # numpy, scipy, scikit-learn, threadpoolctl, pytest
 ├── demo/
-│   ├── parse_protocol.py         # Zero-dependency regex extractor & WLP BRAT evaluator
+│   ├── parse_protocol.py         # Zero-dependency regex extractor, unit normalizer & BRAT scorer
 │   └── output.txt                # Reference WLP test-split metrics (125 protocols)
 ├── docs/
 │   └── ARCHITECTURE_AND_HISTORY.md
+├── results/
+│   └── dcase2023_cpu.json        # Reference single-thread CPU DCASE 2023 evaluation
+├── tests/
+│   ├── test_acoustic.py          # Synthetic unit tests for acoustic features, detectors & ledger
+│   └── test_parse_protocol.py    # Offline unit tests for protocol span extraction & normalization
 ├── LICENSE                       # MIT License
+├── pyproject.toml                # Pytest configuration
 ├── README.md                     # Overview, benchmarks, curated datasets, repos, and papers
-└── requirements.txt              # Standard library only on main (acoustic/ added in PR branch)
+└── requirements.txt              # Standard library only for protocol parser
 ```
 
 ## Contributing
