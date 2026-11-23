@@ -8,25 +8,26 @@ In the lab agent on [yaniguan.github.io](https://yaniguan.github.io/), the ears 
 
 ## First attempt
 
-A rule-based baseline (regular expressions, no learning) that finds **Amount, Temperature, Time and Speed** spans in wet-lab protocols, scored against the gold labels of the Wet Lab Protocols corpus test split (125 protocols). `P_overlap` counts a predicted span as right if it overlaps a gold span of the same type.
+A rule-based baseline (regular expressions, no learning) that finds **Amount, Temperature, Time and Speed** spans in wet-lab protocols, normalizes them into canonical Auto-Lab units (`parse_quantities()`), and scores them against the gold labels of the Wet Lab Protocols corpus test split (125 protocols, commit `1f51ae6e620a5aa3590acf725713f430783f56d7`). Overlap metrics (`P_overlap`, `R_overlap`, `F1_overlap`) use 1-to-1 maximum bipartite matching.
 
 ```bash
-git clone --depth 1 https://github.com/chaitanya2334/WLP-Dataset data/WLP-Dataset
-python demo/parse_protocol.py data/WLP-Dataset/test
+git clone https://github.com/chaitanya2334/WLP-Dataset data/WLP-Dataset
+git -C data/WLP-Dataset checkout 1f51ae6e620a5aa3590acf725713f430783f56d7
+python demo/parse_protocol.py data/WLP-Dataset/test --min-f1 0.78
 ```
 
-Output (Linux, CPU only, 2026-11-18):
+Output (CPU only, re-measured against pinned WLP test split):
 
 ```
-protocols: 125
-label         gold  pred  P_exact  R_exact F1_exact  P_overlap
-Amount        1011  1103    0.756    0.825    0.789      0.773
-Temperature    509   584    0.724    0.831    0.774      0.839
-Time           810   806    0.909    0.905    0.907      0.940
-Speed          155   182    0.692    0.813    0.748      0.747
+protocols: 125 (discontinuous_gold: 2, skipped_discontinuous: 0)
+label           gold  pred  P_exact  R_exact F1_exact  P_overlap  R_overlap F1_overlap
+Amount          1013  1132    0.756    0.845    0.798      0.777      0.869      0.821
+Temperature      509   583    0.799    0.916    0.853      0.851      0.974      0.908
+Time             812   801    0.915    0.903    0.909      0.944      0.931      0.937
+Speed            155   146    0.863    0.813    0.837      0.932      0.877      0.904
 ```
 
-Plain rules already get F1 0.75-0.91 on these four number-like slots. Actions, reagents and the links between them are not tested yet; that is the next step, with a learned parser. Speech input (for example a small Whisper model) comes after that.
+Plain rules reach exact F1 0.80-0.91 (overlap F1 0.82-0.94) on these four number-like slots. Actions, reagents and the links between them are not tested yet; that is the next step, with a learned parser. Speech input (for example a small Whisper model) comes after that.
 
 ## Machine sounds
 
@@ -71,7 +72,7 @@ What this says:
 Lab audio can catch people talking. By default:
 
 - Raw audio is not stored. Only log-mel features (and the score) are kept.
-- `--speech-band drop` (or `log_mel(..., drop_speech_band=True)`) removes mel bins centred between 300 and 3400 Hz, where most speech energy is, keeping only the machine band. With the band dropped, the harmonic mean becomes autoencoder 0.496, gaussian 0.523, knn 0.487 (same file), so it costs some accuracy.
+- `--speech-band drop` (or `log_mel(..., drop_speech_band=True)`) removes every mel filter whose non-zero frequency support `[lo_hz, hi_hz]` overlaps `(300, 3400) Hz`, where speech energy sits, keeping only the machine band (`<= 300 Hz` and `>= 3400 Hz`). In the initial center-frequency DCASE run (`results/dcase2023_cpu.json`), dropping the speech band shifted the harmonic mean to autoencoder 0.496, gaussian 0.523, knn 0.487.
 - A contact microphone or vibration sensor on the instrument picks up much less speech than a room microphone.
 
 Log-mel features are not a guarantee: coarse speech content may still be recoverable from them. Tell people in the room that machines are being recorded.
@@ -87,7 +88,7 @@ Log-mel features are not a guarantee: coarse speech content may still be recover
  "flagged": true, "features_path": null, "speech_band_dropped": true, "raw_audio_kept": false, "notes": ""}
 ```
 
-The timestamp, protocol id and step tie each sound to the step that was running, so a flagged clip can pause the run or explain a failed one later. The example values are made up.
+The timestamp, protocol id and step tie each sound to the step that was running, so a flagged clip can pause the run or explain a failed one later (`python -m acoustic.monitor --train-dir ... --wav ... --out-jsonl ...` calibrates normal thresholds via `calibrate_threshold()` and appends validated JSONL lines). The example values above are illustrative.
 
 ## Datasets
 
@@ -156,12 +157,12 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 
 `lab-ears` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L2 · Auditory & Protocol Sensory Cortex`**.
 
-- **Object**: Sensory ingestion layer that extracts quantitative parameters (`Amount`, `Temperature`, `Time`, `Speed`) from wet-lab protocol prose (`main`) and monitors benchtop machine audio for unsupervised acoustic anomalies with speech-band privacy filtering (`origin/acoustic-anomaly`).
-- **Data**: Wet Lab Protocols (WLP) 125-protocol BRAT test split (MIT) on `main`; DCASE 2023 Task 2 `16 kHz` machine audio (`fan`, `valve`, `bearing`, CC BY 4.0) and `lab-ears/audio-event/v1` JSONL ledger schema on `origin/acoustic-anomaly`.
-- **Model**: Stdlib regex span extractor with `Speed`-over-`Amount` span disambiguation (`demo/parse_protocol.py`); 64-bin HTK log-mel frontend (`300–3400 Hz` speech-band mask) paired with Ledoit-Wolf `GaussianDetector`, `KNNDetector(k=5)`, and 5-frame `AutoencoderDetector` (`128-128-8-128-128`).
-- **Training**: Rule-based zero-parameter baseline on WLP (`0.748–0.907` exact F1); strictly one-class normal-only fitting (`1,000` clips/machine) on DCASE 2023 (`0.555` fullband / `0.496` speech-dropped harmonic mean for autoencoder).
-- **History**: `ba743be` (2026-11-18, `main` WLP protocol parser & curated resources) -> `5476541` (2026-11-18, `origin/acoustic-anomaly` DCASE 2023 acoustic baseline & privacy event schema).
-- **Unique Properties**: Zero external dependencies on `main`, `< 6 ms` median single-thread CPU latency per `10 s` WAV clip, and enforced speech-band/raw-audio privacy validation in `AudioEvent.validate()`.
+- **Object**: Sensory ingestion layer that extracts and normalizes quantitative parameters (`Amount`, `Temperature`, `Time`, `Speed`, plus optional `Concentration`) from wet-lab protocol prose and monitors benchtop machine audio for unsupervised acoustic anomalies with speech-band privacy filtering.
+- **Data**: Wet Lab Protocols (WLP) 125-protocol BRAT test split (MIT, pinned at `1f51ae6e620a5aa3590acf725713f430783f56d7`); DCASE 2023 Task 2 `16 kHz` machine audio (`fan`, `valve`, `bearing`, CC BY 4.0, MD5-verified Zenodo record `7882613`) and `lab-ears/audio-event/v1` JSONL ledger schema.
+- **Model**: Stdlib regex span extractor with contextual `Speed`-vs-`Amount` mass disambiguation, canonical unit normalizer (`parse_quantities`), and 1-to-1 bipartite overlap scorer (`demo/parse_protocol.py`); 64-bin HTK log-mel frontend (strict `[lo_hz, hi_hz]` `300–3400 Hz` speech-band filter exclusion) paired with unsquared Mahalanobis Ledoit-Wolf `GaussianDetector`, few-shot-safe `KNNDetector(k=5)`, and 5-frame `AutoencoderDetector` (`128-128-8-128-128`).
+- **Training**: Rule-based zero-parameter baseline on WLP (`0.798–0.909` exact F1, `0.821–0.937` overlap F1); strictly one-class normal-only fitting (`1,000` clips/machine) on DCASE 2023 (`0.555` fullband / `0.496` speech-dropped harmonic mean for autoencoder) plus quantile threshold calibration (`calibrate_threshold`).
+- **History**: `ba743be` (2026-11-18, `main` WLP protocol parser & curated resources) -> `5476541` (2026-11-18, `acoustic-anomaly` DCASE 2023 acoustic baseline & privacy event schema) -> merged and hardened with full offline test coverage, canonical quantity normalization, and live `acoustic.monitor` JSONL emission.
+- **Unique Properties**: Zero external runtime dependencies for `demo/parse_protocol.py`, `< 6 ms` median single-thread CPU latency per `10 s` WAV clip, dtype-exact PCM normalization, Zip-Slip/MD5-verified dataset fetching, and strict finite/timezone/privacy validation in `AudioEvent.validate()`.
 
 Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
 
@@ -170,15 +171,30 @@ Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITEC
 ```text
 lab-ears/
 ├── .github/workflows/
-│   └── demo.yml                  # CI workflow cloning WLP-Dataset and running protocol parser
+│   └── demo.yml                  # CI workflow: offline pytest, cached pinned WLP-Dataset, F1 gate
+├── acoustic/
+│   ├── __init__.py               # Public acoustic anomaly & monitoring exports
+│   ├── detect.py                 # Gaussian, kNN, Autoencoder detectors & calibrate_threshold()
+│   ├── evaluate.py               # Single-thread DCASE 2023 Task 2 benchmark runner
+│   ├── features.py               # Dtype-aware WAV loader, zero-copy log-mel, speech-band mask
+│   ├── fetch_dcase2023.py        # Timeout + MD5 + Zip-Slip-guarded Zenodo downloader
+│   ├── monitor.py                # CLI/API emitting calibrated AudioEvent JSONL lines
+│   ├── record.py                 # Validated lab-ears/audio-event/v1 ledger schema
+│   └── requirements.txt          # numpy, scipy, scikit-learn, threadpoolctl, pytest
 ├── demo/
-│   ├── parse_protocol.py         # Zero-dependency regex extractor & WLP BRAT evaluator
+│   ├── parse_protocol.py         # Zero-dependency regex extractor, unit normalizer & BRAT scorer
 │   └── output.txt                # Reference WLP test-split metrics (125 protocols)
 ├── docs/
 │   └── ARCHITECTURE_AND_HISTORY.md
+├── results/
+│   └── dcase2023_cpu.json        # Reference single-thread CPU DCASE 2023 evaluation
+├── tests/
+│   ├── test_acoustic.py          # Synthetic unit tests for acoustic features, detectors & ledger
+│   └── test_parse_protocol.py    # Offline unit tests for protocol span extraction & normalization
 ├── LICENSE                       # MIT License
+├── pyproject.toml                # Pytest configuration
 ├── README.md                     # Overview, benchmarks, curated datasets, repos, and papers
-└── requirements.txt              # Standard library only on main (acoustic/ added in PR branch)
+└── requirements.txt              # Standard library only for protocol parser
 ```
 
 ## Contributing

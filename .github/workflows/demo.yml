@@ -6,14 +6,33 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      WLP_COMMIT: 1f51ae6e620a5aa3590acf725713f430783f56d7
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt
-      - run: git clone --depth 1 https://github.com/chaitanya2334/WLP-Dataset data/WLP-Dataset
-      - run: python demo/parse_protocol.py
+      - run: pip install -r requirements.txt pytest>=8
+      - name: Run offline protocol parser unit tests
+        run: python -m pytest -q tests/test_parse_protocol.py
+      - name: Cache pinned WLP-Dataset
+        id: cache-wlp
+        uses: actions/cache@v4
+        with:
+          path: data/WLP-Dataset
+          key: wlp-dataset-${{ env.WLP_COMMIT }}
+      - name: Fetch WLP-Dataset at pinned commit SHA
+        if: steps.cache-wlp.outputs.cache-hit != 'true'
+        run: |
+          git init data/WLP-Dataset
+          git -C data/WLP-Dataset remote add origin https://github.com/chaitanya2334/WLP-Dataset
+          git -C data/WLP-Dataset fetch --depth 1 origin "$WLP_COMMIT"
+          git -C data/WLP-Dataset checkout FETCH_HEAD
+      - name: Verify pinned SHA and run WLP benchmark with F1 gate
+        run: |
+          test "$(git -C data/WLP-Dataset rev-parse HEAD)" = "$WLP_COMMIT"
+          python demo/parse_protocol.py data/WLP-Dataset/test --min-f1 0.78
   acoustic:
     runs-on: ubuntu-latest
     steps:
@@ -22,4 +41,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r acoustic/requirements.txt
-      - run: python -m pytest -q tests/test_acoustic.py
+      - run: python -m pytest -q
