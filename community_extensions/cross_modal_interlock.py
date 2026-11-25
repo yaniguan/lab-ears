@@ -11,10 +11,12 @@ triggering an immediate run-halt before air bubbles are dispensed across an assa
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 SPEECH_BAND_LO_HZ: float = 300.0
 SPEECH_BAND_HI_HZ: float = 3400.0
@@ -85,22 +87,62 @@ class InterlockDecision:
     stall_ratio: float
     score: float
 
+    def to_wire_dict(self, *, instrument_id: str = "liquid-handler-01") -> dict[str, Any]:
+        """Serialize interlock decision for `autolab-wire/v1` packet transport."""
+        return {
+            "step_index": int(self.step_index),
+            "instrument_id": str(instrument_id),
+            "halt_run": bool(self.halt_run),
+            "reason": str(self.reason),
+            "raw_audio_saved": bool(self.raw_audio_saved),
+            "raw_audio_kept": bool(self.raw_audio_saved),
+            "speech_band_dropped": bool(self.speech_band_dropped),
+            "retained_bands_hz": (
+                [list(LOW_STALL_BAND_HZ), list(HIGH_CAVITATION_BAND_HZ)]
+                if self.speech_band_dropped
+                else []
+            ),
+            "cavitation_ratio": float(self.cavitation_ratio),
+            "stall_ratio": float(self.stall_ratio),
+            "score": float(self.score),
+        }
 
-def verify_privacy_bands(bands_hz: tuple[tuple[float, float], ...]) -> bool:
-    """Verify every retained band lies strictly outside (300, 3400) Hz."""
+
+def verify_privacy_bands(
+    bands_hz: tuple[tuple[float, float], ...],
+    *,
+    sample_rate_hz: int | None = None,
+    skirt_hz: float = 0.0,
+) -> bool:
+    """Verify retained bands are non-empty, below Nyquist, and strictly outside (300, 3400) Hz."""
+    if not bands_hz or skirt_hz < 0.0 or not math.isfinite(float(skirt_hz)):
+        return False
+    nyquist_hz = 0.5 * float(sample_rate_hz) if sample_rate_hz is not None else None
     for lo_hz, hi_hz in bands_hz:
-        if lo_hz > hi_hz:
+        if not (math.isfinite(float(lo_hz)) and math.isfinite(float(hi_hz))):
             return False
-        if not (hi_hz <= SPEECH_BAND_LO_HZ or lo_hz >= SPEECH_BAND_HI_HZ):
+        if lo_hz > hi_hz or lo_hz < 0.0:
+            return False
+        if nyquist_hz is not None and hi_hz > nyquist_hz:
+            return False
+        if not ((hi_hz + skirt_hz) <= SPEECH_BAND_LO_HZ or (lo_hz - skirt_hz) >= SPEECH_BAND_HI_HZ):
             return False
     return True
+
+
+def _default_stft_params(sample_rate_hz: int) -> tuple[int, int]:
+    """Scale STFT window (>= 32 ms power of two) and hop (~10 ms) with sample rate."""
+    target_n = max(512, int(math.ceil(float(sample_rate_hz) * 0.032)))
+    n_fft = 1 << (target_n - 1).bit_length()
+    hop_length = max(1, int(round(float(sample_rate_hz) * 0.010)))
+    return n_fft, hop_length
 
 
 def extract_voice_stripped_band_energies(
     waveform: np.ndarray,
     sample_rate_hz: int = 16000,
-    n_fft: int = 512,
-    hop_length: int = 160,
+    n_fft: int | None = None,
+    hop_length: int | None = None,
 ) -> VoiceStrippedFeatures:
     """Compute STFT band energies while hard-dropping every bin overlapping (300, 3400) Hz.
 
@@ -109,45 +151,78 @@ def extract_voice_stripped_band_energies(
     whose full main-lobe skirt lies inside [60, 260] Hz or [3600, 7800] Hz, guaranteeing
     zero overlap with [300, 3400] Hz human conversation.
     """
-    if sample_rate_hz < 8000:
+    if isinstance(sample_rate_hz, bool) or int(sample_rate_hz) < 8000:
         raise ValueError(f"sample_rate_hz={sample_rate_hz} below 8000 Hz machine floor")
-    x = np.asarray(waveform, dtype=np.float64).ravel()
-    if x.size < n_fft:
-        x = np.pad(x, (0, n_fft - x.size))
+    sample_rate_hz = int(sample_rate_hz)
 
     retained_bands = (LOW_STALL_BAND_HZ, HIGH_CAVITATION_BAND_HZ)
-    if not verify_privacy_bands(retained_bands):
-        raise AssertionError("Retained bands violated [300, 3400] Hz speech-drop invariant")
+    nyquist_hz = 0.5 * float(sample_rate_hz)
+    for lo_hz, hi_hz in retained_bands:
+        if hi_hz > nyquist_hz:
+            raise ValueError(
+                f"Retained band [{lo_hz}, {hi_hz}] Hz exceeds Nyquist limit {nyquist_hz} Hz "
+                f"for sample_rate_hz={sample_rate_hz} (>= {int(math.ceil(2.0 * hi_hz))} Hz required)"
+            )
 
-    # Stage 1: Full-clip spectral notch removing [300, 3400] Hz to prevent short-window sidelobe bleed
+    def_n_fft, def_hop = _default_stft_params(sample_rate_hz)
+    n_fft_val = def_n_fft if n_fft is None else int(n_fft)
+    hop_val = def_hop if hop_length is None else int(hop_length)
+    if n_fft_val < 16 or hop_val < 1:
+        raise ValueError(f"Invalid STFT parameters n_fft={n_fft_val}, hop_length={hop_val}")
+
+    raw_arr = np.asarray(waveform, dtype=np.float64)
+    if raw_arr.size == 0:
+        raise ValueError("Waveform must contain at least 1 sample")
+    if not np.isfinite(raw_arr).all():
+        raise ValueError("Waveform contains NaN or Inf")
+
+    if not verify_privacy_bands(retained_bands, sample_rate_hz=sample_rate_hz):
+        raise AssertionError("Retained bands violated [300, 3400] Hz speech-drop or Nyquist invariant")
+
+    x = raw_arr.ravel()
+    # Stage 1: Full-clip spectral notch removing [300, 3400] Hz BEFORE zero-padding to avoid step leakage
     clip_spec = np.fft.rfft(x)
     clip_freqs = np.fft.rfftfreq(x.size, d=1.0 / sample_rate_hz)
     speech_notch = (clip_freqs >= SPEECH_BAND_LO_HZ) & (clip_freqs <= SPEECH_BAND_HI_HZ)
     clip_spec[speech_notch] = 0.0
     x = np.fft.irfft(clip_spec, n=x.size)
 
-    n_frames = 1 + (x.size - n_fft) // hop_length
-    window = np.hanning(n_fft)
+    if x.size < n_fft_val:
+        x = np.pad(x, (0, n_fft_val - x.size))
+    else:
+        rem = (x.size - n_fft_val) % hop_val
+        if rem != 0:
+            x = np.pad(x, (0, hop_val - rem))
+    x = np.ascontiguousarray(x, dtype=np.float64)
+
+    window = np.hanning(n_fft_val)
     win_norm = float(np.sum(window * window)) + 1e-12
 
-    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate_hz)
-    df = float(sample_rate_hz) / float(n_fft)
+    freqs = np.fft.rfftfreq(n_fft_val, d=1.0 / sample_rate_hz)
+    df = float(sample_rate_hz) / float(n_fft_val)
 
     # Full-skirt support [f - df, f + df] must stay within each target band and outside [300, 3400] Hz
     lo_mask = ((freqs - df) >= LOW_STALL_BAND_HZ[0]) & ((freqs + df) <= LOW_STALL_BAND_HZ[1])
     hi_mask = ((freqs - df) >= HIGH_CAVITATION_BAND_HZ[0]) & ((freqs + df) <= HIGH_CAVITATION_BAND_HZ[1])
+    if not np.any(lo_mask) or not np.any(hi_mask):
+        raise ValueError(
+            f"Empty STFT band mask (lo_bins={int(np.sum(lo_mask))}, hi_bins={int(np.sum(hi_mask))}) "
+            f"for sample_rate_hz={sample_rate_hz}, n_fft={n_fft_val} (df={df:.2f} Hz)"
+        )
     assert not np.any(lo_mask & hi_mask)
     assert np.all((freqs[lo_mask] + df) <= SPEECH_BAND_LO_HZ)
     assert np.all((freqs[hi_mask] - df) >= SPEECH_BAND_HI_HZ)
 
-    strides = (x.strides[0] * hop_length, x.strides[0])
-    frames = np.lib.stride_tricks.as_strided(x, shape=(n_frames, n_fft), strides=strides)
+    frames = sliding_window_view(x, n_fft_val)[::hop_val]
+    n_frames = int(frames.shape[0])
     spec = np.fft.rfft(frames * window[None, :], axis=1)
     power = (np.abs(spec) ** 2) / win_norm
 
     lo_power = np.mean(power[:, lo_mask], axis=1)
     hi_power = np.mean(power[:, hi_mask], axis=1)
-    frame_times = (np.arange(n_frames, dtype=np.float64) * hop_length + 0.5 * n_fft) / sample_rate_hz
+    if not (np.isfinite(lo_power).all() and np.isfinite(hi_power).all()):
+        raise ValueError("Non-finite STFT band power computed")
+    frame_times = (np.arange(n_frames, dtype=np.float64) * hop_val + 0.5 * n_fft_val) / sample_rate_hz
 
     return VoiceStrippedFeatures(
         raw_audio_saved=False,
@@ -167,10 +242,15 @@ class SpeechUnfilteredRMSDetector:
         self.rms_threshold: float = 0.05
 
     def calibrate(self, normal_quiet_clips: list[np.ndarray]) -> None:
-        rms_vals = np.array(
-            [float(np.sqrt(np.mean(np.asarray(c, dtype=np.float64) ** 2))) for c in normal_quiet_clips],
-            dtype=np.float64,
-        )
+        if not normal_quiet_clips:
+            raise ValueError("Calibration requires at least one quiet clip")
+        vals: list[float] = []
+        for c in normal_quiet_clips:
+            arr = np.asarray(c, dtype=np.float64)
+            if arr.size == 0 or not np.isfinite(arr).all():
+                raise ValueError("Waveform must be non-empty and finite")
+            vals.append(float(np.sqrt(np.mean(arr ** 2))))
+        rms_vals = np.array(vals, dtype=np.float64)
         mu = float(np.mean(rms_vals))
         sd = float(np.std(rms_vals)) + 1e-9
         self.rms_threshold = mu + self.sigma_multiplier * sd
@@ -180,7 +260,10 @@ class SpeechUnfilteredRMSDetector:
         waveform: np.ndarray,
         command: PipettingCommandWindow,
     ) -> InterlockDecision:
-        rms = float(np.sqrt(np.mean(np.asarray(waveform, dtype=np.float64) ** 2)))
+        arr = np.asarray(waveform, dtype=np.float64)
+        if arr.size == 0 or not np.isfinite(arr).all():
+            raise ValueError("Waveform must be non-empty and finite")
+        rms = float(np.sqrt(np.mean(arr ** 2)))
         flagged = rms > self.rms_threshold
         return InterlockDecision(
             step_index=command.step_index,
@@ -198,6 +281,14 @@ class CrossModalInterlockDetector:
     """Voice-stripped, command-synchronized cavitation & stepper-stall interlock."""
 
     def __init__(self, sample_rate_hz: int = 16000) -> None:
+        if isinstance(sample_rate_hz, bool) or int(sample_rate_hz) < 8000:
+            raise ValueError(f"sample_rate_hz={sample_rate_hz} below 8000 Hz machine floor")
+        min_nyquist_sr = int(math.ceil(2.0 * HIGH_CAVITATION_BAND_HZ[1]))
+        if int(sample_rate_hz) < min_nyquist_sr:
+            raise ValueError(
+                f"sample_rate_hz={sample_rate_hz} insufficient for high cavitation band "
+                f"{HIGH_CAVITATION_BAND_HZ} Hz (>= {min_nyquist_sr} Hz required)"
+            )
         self.sample_rate_hz = int(sample_rate_hz)
         self.base_lo_power: float = 1e-5
         self.base_hi_power: float = 1e-5
@@ -222,8 +313,14 @@ class CrossModalInterlockDetector:
 
         if not lo_normed or not hi_normed:
             raise ValueError("Calibration requires at least one active normal transfer clip")
-        self.base_lo_power = float(np.median(lo_normed)) + 1e-12
-        self.base_hi_power = float(np.median(hi_normed)) + 1e-12
+        base_lo = float(np.median(lo_normed)) + 1e-12
+        base_hi = float(np.median(hi_normed)) + 1e-12
+        if not (math.isfinite(base_lo) and math.isfinite(base_hi) and base_lo > 0.0 and base_hi > 0.0):
+            raise ValueError(
+                f"Non-finite or non-positive calibrated band baseline (lo={base_lo!r}, hi={base_hi!r})"
+            )
+        self.base_lo_power = base_lo
+        self.base_hi_power = base_hi
         self.calibrated = True
 
     def evaluate(
@@ -270,6 +367,8 @@ class CrossModalInterlockDetector:
         # Subtract stationary room background estimated outside the active command window
         hi_bg = float(np.median(feats.hi_band_power[out_win])) if np.any(out_win) else 0.0
         lo_bg = float(np.median(feats.lo_band_power[out_win])) if np.any(out_win) else 0.0
+        if not (math.isfinite(hi_in) and math.isfinite(lo_in) and math.isfinite(hi_bg) and math.isfinite(lo_bg)):
+            raise ValueError("Non-finite window band power statistics encountered during interlock evaluation")
 
         cavitation_ratio = max(0.0, hi_in - 0.5 * hi_bg) / (
             self.base_hi_power * prior["expected_hi_power"] * vol_scale
@@ -277,6 +376,10 @@ class CrossModalInterlockDetector:
         stall_ratio = max(0.0, lo_in - 0.5 * lo_bg) / (
             self.base_lo_power * prior["expected_lo_power"] * vol_scale
         )
+        if not (math.isfinite(cavitation_ratio) and math.isfinite(stall_ratio)):
+            raise ValueError(
+                f"Non-finite interlock ratio computed (cavitation={cavitation_ratio!r}, stall={stall_ratio!r})"
+            )
 
         is_cavitation = cavitation_ratio > prior["cavitation_ratio_limit"]
         is_stall = stall_ratio > prior["stall_ratio_limit"]
@@ -295,6 +398,8 @@ class CrossModalInterlockDetector:
             cavitation_ratio / prior["cavitation_ratio_limit"],
             stall_ratio / prior["stall_ratio_limit"],
         )
+        if not math.isfinite(score):
+            raise ValueError(f"Non-finite interlock score computed: {score!r}")
         return InterlockDecision(
             step_index=command.step_index,
             halt_run=halt,

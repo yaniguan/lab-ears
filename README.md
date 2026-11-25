@@ -72,7 +72,7 @@ What this says:
 Lab audio can catch people talking. By default:
 
 - Raw audio is not stored. Only log-mel features (and the score) are kept.
-- `--speech-band drop` (or `log_mel(..., drop_speech_band=True)`) removes every mel filter whose non-zero frequency support `[lo_hz, hi_hz]` overlaps `(300, 3400) Hz`, where speech energy sits, keeping only the machine band (`<= 300 Hz` and `>= 3400 Hz`). In the initial center-frequency DCASE run (`results/dcase2023_cpu.json`), dropping the speech band shifted the harmonic mean to autoencoder 0.496, gaussian 0.523, knn 0.487.
+- `--speech-band drop` (or `log_mel(..., drop_speech_band=True)`) applies a pre-STFT `[300, 3400] Hz` spectral notch and removes every mel filter whose Hann-skirted support `[lo_hz - 2*df, hi_hz + 2*df]` overlaps `(300, 3400) Hz`, keeping only sub-speech (`<= 255 Hz`) and high-band (`>= 3464 Hz`) machine energy (`>= 60 dB` speech-fundamental suppression, CPU/synthetic verified). In the historical 2026-11-18 DCASE 2023 CPU baseline run (`results/dcase2023_cpu.json`, center-frequency mask), dropping the speech band shifted the harmonic mean to autoencoder 0.496, gaussian 0.523, knn 0.487.
 - A contact microphone or vibration sensor on the instrument picks up much less speech than a room microphone.
 
 Log-mel features are not a guarantee: coarse speech content may still be recoverable from them. Tell people in the room that machines are being recorded.
@@ -166,6 +166,15 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 
 Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
 
+## 15-Repository Auto-Lab Wire Contract (`autolab-wire/v1`)
+
+`autolab_wire.py` exposes `process_packet(packet: dict) -> dict` (`REPO_ID = "lab-ears"`, `LAYER = "L2"`) as the sensory entry node of the 15-repository Auto-Lab closed loop:
+
+- **Upstream / Entry Inputs**: Free-form `goal_text`, acoustic `retained_bands_hz` (default `[[60, 260], [3600, 7800]]`), `sample_rate_hz` (`16000`), `window_skirt_hz` (`0.0`), `raw_audio_saved` / `raw_audio_kept` (`False`), and optional `audio_events` (`lab-ears/audio-event/v1`) or `interlock_decision` (`InterlockDecision`). Halted upstream packets (`halted=True`) short-circuit unchanged.
+- **L2 Guardrails (`full_skirt_speech_band_drop`, `cross_modal_cavitation_or_stall_interlock`, `calibrated_anomaly_threshold`)**: Enforces the Lean-verified speech-privacy, non-empty band, Nyquist (`2 * hi_hz <= sample_rate_hz`), and Hann-skirt invariants (`halt_reason = "L2_SPEECH_PRIVACY_BLOCK"`), and propagates active cavitation/stepper-stall halts (`"L2_CAVITATION_INTERLOCK_HALT"`) and calibrated anomaly flags (`"L2_ACOUSTIC_ANOMALY_HALT"`) with normalized `acoustic_telemetry`.
+- **Downstream Handoff (`lab-ears -> lab-ask-why, stepbot`)**: Emits `parsed_spans` (`spans` with `canonical_min`/`canonical_max`, clause-segmented `steps`, `amounts`, `temperatures`, `times`, `speeds`, `concentrations`, primary-anchored `volume_ul`/`temp_c`/`duration_min`, and `defaults_applied`), `acoustic_telemetry`, `speech_band_dropped`, `trace`, and `bottom_reasoning_traces` for downstream epistemic probing in `lab-ask-why`, liquid-handling compilation in `stepbot`, window scheduling in `labshift`, twin simulation in `lab-rehearsal`, causal blame in `lab-attrib`, and DAG construction in `twinstep`.
+- **15-Repository Stack**: `lab-ears` (`L2`) -> `lab-ask-why`, `lab-decide` (`L6`) -> `lab-automation-atlas`, `buy-or-make`, `labshift` (`L5`) -> `lab-rehearsal`, `lab-verify` (`L4`) -> `stepbot`, `lab-hands` (`L1`) -> `lab-feet` (`L0`) -> `lab-attrib` (`L4` post-execution causal blame & certified ledger) -> `twinstep`, `labfill`, `labbench-posttrain` (`L3`, feeding verified updates back to `lab-decide` and `lab-feet`).
+
 ## Repository Layout
 
 ```text
@@ -181,16 +190,23 @@ lab-ears/
 │   ├── monitor.py                # CLI/API emitting calibrated AudioEvent JSONL lines
 │   ├── record.py                 # Validated lab-ears/audio-event/v1 ledger schema
 │   └── requirements.txt          # numpy, scipy, scikit-learn, threadpoolctl, pytest
+├── community_extensions/
+│   └── cross_modal_interlock.py  # Voice-stripped cavitation & stepper-stall interlock
 ├── demo/
 │   ├── parse_protocol.py         # Zero-dependency regex extractor, unit normalizer & BRAT scorer
 │   └── output.txt                # Reference WLP test-split metrics (125 protocols)
 ├── docs/
 │   └── ARCHITECTURE_AND_HISTORY.md
+├── lean/
+│   └── LabEarsLean.lean          # Lean 4 voice-privacy & cross-modal interlock proofs
 ├── results/
 │   └── dcase2023_cpu.json        # Reference single-thread CPU DCASE 2023 evaluation
 ├── tests/
 │   ├── test_acoustic.py          # Synthetic unit tests for acoustic features, detectors & ledger
+│   ├── test_autolab_wire.py      # Unit tests for autolab-wire/v1 packet processing & privacy block
+│   ├── test_community_extensions.py
 │   └── test_parse_protocol.py    # Offline unit tests for protocol span extraction & normalization
+├── autolab_wire.py               # L2 autolab-wire/v1 node (protocol spans + speech-band gate)
 ├── LICENSE                       # MIT License
 ├── pyproject.toml                # Pytest configuration
 ├── README.md                     # Overview, benchmarks, curated datasets, repos, and papers

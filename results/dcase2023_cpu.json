@@ -2,6 +2,8 @@
   "dataset": "DCASE 2023 Task 2 dev (Zenodo 7882613, CC BY 4.0)",
   "cpu": "x86_64",
   "threads": 1,
+  "verification_scope": "offline_10s_clip_cpu_measured; live_streaming_and_benchtop_interlock_cpu_synthetic_verified",
+  "speech_band_note": "Historical 2026-11-18 DCASE 2023 CPU baseline run; full Hann-skirt + pre-STFT speech notch and causal streaming pooling verified in offline CPU synthetic test suite.",
   "rows": [
     {
       "auc_source": 0.4748,

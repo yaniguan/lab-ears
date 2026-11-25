@@ -15,10 +15,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-SCALAR = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:[.,]\d+)?"
+_MANTISSA = r"(?:[1-9]\d{0,2}(?:,\d{3})+|\d+)(?:[.,]\d+)?"
+_SCI_EXP = r"(?:[eE][-−+]?\d+|\s*[x×]\s*10\s*\^\s*[-−+]?\d+|\^\s*[-−+]?\d+)"
+SCALAR = rf"{_MANTISSA}(?:{_SCI_EXP})?"
 RANGE_SEP = r"(?:\s*(?:-|–|−|to)\s*)"
-NUM = rf"(?<!\w){SCALAR}(?:{RANGE_SEP}{SCALAR})?"
-TEMP_NUM = rf"(?<!\w)(?:(?<![\w.])[-−–]{SCALAR}|{SCALAR})(?:{RANGE_SEP}[-−–]?{SCALAR})?"
+_NUM_LEFT_GUARD = r"(?<![\w.^])(?<![eE][-−+])(?<!\^[-−+])"
+NUM = rf"{_NUM_LEFT_GUARD}{SCALAR}(?:{RANGE_SEP}{SCALAR})?"
+TEMP_NUM = (
+    rf"{_NUM_LEFT_GUARD}(?:(?<![\w.^])[-+−–]{SCALAR}|{SCALAR})"
+    rf"(?:{RANGE_SEP}[-+−–]?{SCALAR})?"
+)
 
 CONCENTRATION_RULE = (
     NUM + r"\s*(?:"
@@ -26,7 +32,7 @@ CONCENTRATION_RULE = (
     r"(?i:(?:mU|U|units?)\s*/\s*(?:ml|µl|μl|ul)\b)|"
     r"(?:[mµμunpf]?M)\b|"
     r"%(?:\s*(?i:\(?[wv]\s*/\s*[wv]\)?))?|"
-    r"(?<=\d)\s*[xX]\b"
+    r"(?<=\d)\s*[xX]\b(?!\s*(?:g\b|10\s*\^))"
     r")"
 )
 
@@ -64,7 +70,10 @@ _THERMAL_CTX = re.compile(
     re.IGNORECASE,
 )
 _THERMAL_PREP = re.compile(r"(?:\b(?:at|to|in)\s+|\(\s*)$", re.IGNORECASE)
-_NON_THERMAL_AFTER = re.compile(r"^\s*(?:MWCO|label\w*)\b", re.IGNORECASE)
+_NON_THERMAL_AFTER = re.compile(
+    r"^\s*(?:MWCO|label\w*|NMR\b|isotop\w*|enrich\w*|spectrum\b|spectra\b|shift\w*)",
+    re.IGNORECASE,
+)
 
 _SPEED_BARE_G = re.compile(NUM + r"\s*g\b")
 _CENTRIFUGE_CTX = re.compile(
@@ -96,17 +105,31 @@ class ParsedQuantity:
     canonical_max: Optional[float] = None
 
 
-def _parse_scalar_str(token: str) -> float:
+def _parse_mantissa_str(token: str) -> float:
     s = token.strip().replace("−", "-").replace("–", "-")
-    if re.fullmatch(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", s):
+    if re.fullmatch(r"[-+]?[1-9]\d{0,2}(?:,\d{3})+(?:\.\d+)?", s):
         s = s.replace(",", "")
     else:
         s = s.replace(",", ".")
     return float(s)
 
 
+def _parse_scalar_str(token: str) -> float:
+    s = token.strip().replace("−", "-").replace("–", "-")
+    m_pow10 = re.fullmatch(r"(?P<mant>.+?)\s*[x×]\s*10\s*\^\s*(?P<exp>[-+]?\d+)", s)
+    if m_pow10 is not None:
+        return _parse_mantissa_str(m_pow10.group("mant")) * (10.0 ** int(m_pow10.group("exp")))
+    m_caret = re.fullmatch(r"(?P<base>.+?)\^\s*(?P<exp>[-+]?\d+)", s)
+    if m_caret is not None:
+        return _parse_mantissa_str(m_caret.group("base")) ** int(m_caret.group("exp"))
+    m_sci = re.fullmatch(r"(?P<mant>.+?)[eE](?P<exp>[-+]?\d+)", s)
+    if m_sci is not None:
+        return _parse_mantissa_str(m_sci.group("mant")) * (10.0 ** int(m_sci.group("exp")))
+    return _parse_mantissa_str(s)
+
+
 def _first_scalar_value(raw: str) -> float:
-    m = re.match(r"[-−–]?" + SCALAR, raw.strip())
+    m = re.match(r"[-+−–]?" + SCALAR, raw.strip())
     if not m:
         return 0.0
     return _parse_scalar_str(m.group())
@@ -175,9 +198,13 @@ def find_spans(text: str, *, include_concentration: bool = False) -> Set[Tuple[s
     spans = {
         (l, s, e)
         for l, s, e in spans
-        if not (l == "Amount" and any(s2 <= s and e <= e2 for s2, e2 in speed_ranges))
+        if not (
+            l in ("Amount", "Concentration")
+            and any(s2 <= s and e <= e2 for s2, e2 in speed_ranges)
+        )
     }
     if include_concentration:
+        spans = _dedupe_nested(spans, "Concentration")
         conc_ranges = [(s, e) for l, s, e in spans if l == "Concentration"]
         spans = {
             (l, s, e)
@@ -240,6 +267,7 @@ _TIME_TO_S = {
     "days": 86400.0,
 }
 _MOLAR_TO_MM = {
+    "fM": 1e-12,
     "pM": 1e-9,
     "nM": 1e-6,
     "uM": 1e-3,
@@ -250,7 +278,7 @@ _MOLAR_TO_MM = {
 }
 
 _NUM_RANGE_PREFIX = re.compile(
-    rf"^\s*(?P<v1>[-−–]?{SCALAR})(?:{RANGE_SEP}(?P<v2>[-−–]?{SCALAR}))?\s*(?P<unit>.*?)\s*$"
+    rf"^\s*(?P<v1>[-+−–]?{SCALAR})(?:{RANGE_SEP}(?P<v2>[-+−–]?{SCALAR}))?\s*(?P<unit>.*?)\s*$"
 )
 
 

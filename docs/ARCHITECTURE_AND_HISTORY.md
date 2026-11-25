@@ -163,5 +163,28 @@ All three detectors implement `.fit(mels)` on normal clips only and `.score(mel)
 ### Ecosystem Interfaces Across Auto-Lab
 
 - **Downstream to `L1` (`stepbot`, `twinstep`)**: Extracted `Amount`, `Temperature`, `Time`, and `Speed` spans ground free-text wet-lab procedures into typed liquid-handling YAML/JSON steps for [`stepbot`](https://github.com/yaniguan/stepbot) and protocol verification benchmarks in [`twinstep`](https://github.com/yaniguan/twinstep).
-- **Downstream to `L3` (`YLM`) & `L4` (`lab-rehearsal`, `lab-verify`)**: Structured protocol slots feed [`YLM`](https://github.com/yaniguan/YLM) multimodal reasoning, while `lab-ears/audio-event/v1` JSONL events join [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal)'s `runs.jsonl` execution ledger and [`lab-verify`](https://github.com/yaniguan/lab-verify)'s safety gates to pause or annotate runs when an instrument sounds abnormal.
+- **Downstream to `L3` (`YLM`) & `L4` (`lab-rehearsal`, `lab-verify`, `lab-attrib`)**: Structured protocol slots feed [`YLM`](https://github.com/yaniguan/YLM) multimodal reasoning, while `lab-ears/audio-event/v1` JSONL events join [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal)'s `runs.jsonl` execution ledger, [`lab-verify`](https://github.com/yaniguan/lab-verify)'s safety gates, and [`lab-attrib`](https://github.com/yaniguan/lab-attrib)'s post-execution causal blame attribution to pause or quarantine runs when an instrument sounds abnormal.
 - **Downstream to `L0` (`lab-feet`)**: Acoustic autoencoders and future small Whisper/audio-embedding models target [`lab-feet`](https://github.com/yaniguan/lab-feet) for `int8`/`4-bit` edge deployment on contact-microphone boards mounted directly on lab instruments.
+
+---
+
+## 7. 15-Repository Auto-Lab Wire Contract (`autolab-wire/v1`)
+
+`autolab_wire.py` (`REPO_ID = "lab-ears"`, `LAYER = "L2"`) implements `process_packet(packet: dict) -> dict` as the `L2` sensory and protocol-comprehension entry point of the 15-repository Auto-Lab wire bus:
+
+- **Path & State Discipline**: Resolves all repository-local resources strictly via `REPO_DIR = Path(__file__).resolve().parent` (never `os.getcwd()`), deep-copies incoming packets, initializes `autolab-wire/v1` envelope defaults (`schema_version`, `halted`, `halt_reason`, `trace`, `bottom_reasoning_traces`), and short-circuits unchanged when `halted` is already `True`.
+- **Step-Indexed Protocol Span Normalization & Range Bounds**: Invokes `demo/parse_protocol.py` (`parse_quantities(..., include_concentration=True)`) on `goal_text` (handling European comma decimals, scientific notation, signed thermal ranges, and `13C NMR` isotope disambiguation), segments ordered protocol clauses into `parsed_spans["steps"]`, anchors top-level `volume_ul` (`uL`, default `100.0`), `temp_c` (`C`, default `25.0`), and `duration_min` (`min`, default `15.0`) to the primary reaction/incubation step while preserving `canonical_min`/`canonical_max` intervals and recording fallback defaults in `defaults_applied`.
+- **Lean Speech-Band, Nyquist & Hann-Skirt Gate (`full_skirt_speech_band_drop`)**: Harmonizes `raw_audio_saved` and `raw_audio_kept`, verifies non-empty `retained_bands_hz` (default `[[60, 260], [3600, 7800]]`), checks Nyquist realizability (`2 * hi <= sample_rate_hz`) and Hann-skirt separation (`hi + window_skirt_hz <= 300` or `lo - window_skirt_hz >= 3400`, matching `LabEarsLean.checkLabEars`), and halts privacy violations with `halt_reason = "L2_SPEECH_PRIVACY_BLOCK"`.
+- **Calibrated Acoustic Anomaly & Cross-Modal Interlock Propagation**: Inspects attached `AudioEvent` (`lab-ears/audio-event/v1`) and `InterlockDecision` records, emitting normalized `out["acoustic_telemetry"]` and halting active faults with `"L2_CAVITATION_INTERLOCK_HALT"` or `"L2_ACOUSTIC_ANOMALY_HALT"` (live benchtop interlock and streaming ring-buffer monitoring verified on CPU synthetic test suites; offline DCASE 2023 Task 2 baseline measured on single-thread CPU).
+- **Upstream / Downstream Links (`lab-ears -> lab-ask-why, stepbot`)**:
+  - **Upstream**: Scientist/operator `goal_text`, benchtop acoustic filter configuration, and calibrated `AudioEvent` / `InterlockDecision` telemetry.
+  - **Downstream**: Passes `parsed_spans`, `acoustic_telemetry`, and `speech_band_dropped` to `lab-ask-why` (`L6` epistemic contradiction probing), `stepbot`/`lab-hands` (`L1` liquid-handler compilation & mid-step halt), `labshift` (`L5` incubation window scheduling), `lab-rehearsal`/`lab-verify`/`lab-attrib` (`L4` twin simulation, formal gate & causal blame), and `twinstep` (`L3` protocol dependency DAGs).
+- **Full 15-Repository Stack**:
+  1. `L2` Sensory & Protocol Cortex: `lab-ears`
+  2. `L6` Epistemic & Conformal Brain: `lab-ask-why`, `lab-decide`
+  3. `L5` Ontology, Make-vs-Buy & Scheduling: `lab-automation-atlas`, `buy-or-make`, `labshift`
+  4. `L4` Pre-Run Twin, Formal Gate & Post-Run Attribution: `lab-rehearsal`, `lab-verify`, `lab-attrib`
+  5. `L1` Protocol Compilation & Robotic Kinematics: `stepbot`, `lab-hands`
+  6. `L0` Quantized Edge Execution: `lab-feet`
+  7. `L3` Error Twins, Sequence Packing & RLVR Post-Training: `twinstep`, `labfill`, `labbench-posttrain`
+

@@ -10,7 +10,9 @@ import json
 import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
+
+from .features import SPEECH_BAND_HZ, retained_mel_bands_hz
 
 SCHEMA = "lab-ears/audio-event/v1"
 
@@ -36,6 +38,31 @@ class AudioEvent:
     raw_audio_kept: bool = False
     notes: str = ""
     schema: str = field(default=SCHEMA)
+    source_sample_rate_hz: Optional[int] = None
+    raw_audio_saved: Optional[bool] = None
+    retained_bands_hz: Optional[List[List[int]]] = None
+
+    def __post_init__(self) -> None:
+        if self.raw_audio_saved is None and isinstance(self.raw_audio_kept, bool):
+            self.raw_audio_saved = self.raw_audio_kept
+        if (
+            self.source_sample_rate_hz is None
+            and isinstance(self.sample_rate_hz, int)
+            and not isinstance(self.sample_rate_hz, bool)
+            and self.sample_rate_hz > 0
+        ):
+            self.source_sample_rate_hz = self.sample_rate_hz
+        if (
+            self.retained_bands_hz is None
+            and isinstance(self.sample_rate_hz, int)
+            and not isinstance(self.sample_rate_hz, bool)
+            and self.sample_rate_hz > 0
+            and isinstance(self.speech_band_dropped, bool)
+        ):
+            self.retained_bands_hz = retained_mel_bands_hz(
+                drop_speech_band=self.speech_band_dropped,
+                sr=self.sample_rate_hz,
+            )
 
     @property
     def flagged(self) -> bool:
@@ -58,6 +85,9 @@ class AudioEvent:
             raise ValueError("AudioEvent JSON line must decode to an object")
         had_flagged = "flagged" in d
         raw_flagged = d.pop("flagged", None)
+        # Synchronize raw_audio_kept <-> raw_audio_saved when only one is supplied externally
+        if "raw_audio_saved" in d and "raw_audio_kept" not in d and isinstance(d["raw_audio_saved"], bool):
+            d["raw_audio_kept"] = d["raw_audio_saved"]
         event = cls(**d)
         event.validate()
         if had_flagged and raw_flagged is not event.flagged:
@@ -81,6 +111,12 @@ class AudioEvent:
             raise ValueError(f"duration_s must be finite and > 0, got {self.duration_s!r}")
         if not isinstance(self.sample_rate_hz, int) or isinstance(self.sample_rate_hz, bool) or self.sample_rate_hz <= 0:
             raise ValueError(f"sample_rate_hz must be an integer > 0, got {self.sample_rate_hz!r}")
+        if self.source_sample_rate_hz is not None and (
+            not isinstance(self.source_sample_rate_hz, int)
+            or isinstance(self.source_sample_rate_hz, bool)
+            or self.source_sample_rate_hz <= 0
+        ):
+            raise ValueError(f"source_sample_rate_hz must be an integer > 0, got {self.source_sample_rate_hz!r}")
         if not _is_real_number(self.score) or not math.isfinite(float(self.score)):
             raise ValueError(f"score must be finite, got {self.score!r}")
         if not _is_real_number(self.threshold) or not math.isfinite(float(self.threshold)):
@@ -93,8 +129,36 @@ class AudioEvent:
             raise ValueError("start_utc must be timezone-aware (e.g. trailing 'Z' or '+00:00')")
         if not isinstance(self.raw_audio_kept, bool) or not isinstance(self.speech_band_dropped, bool):
             raise ValueError("raw_audio_kept and speech_band_dropped must be booleans")
+        if self.raw_audio_saved is not None:
+            if not isinstance(self.raw_audio_saved, bool):
+                raise ValueError("raw_audio_saved must be a boolean")
+            if self.raw_audio_saved != self.raw_audio_kept:
+                raise ValueError(
+                    f"raw_audio_saved={self.raw_audio_saved!r} disagrees with raw_audio_kept={self.raw_audio_kept!r}"
+                )
         if self.raw_audio_kept and self.speech_band_dropped:
             raise ValueError("raw audio still contains the speech band")
+        if self.retained_bands_hz is not None:
+            if not isinstance(self.retained_bands_hz, list) or not self.retained_bands_hz:
+                raise ValueError("retained_bands_hz must be a non-empty list of [lo_hz, hi_hz] pairs")
+            nyquist = 0.5 * float(self.sample_rate_hz)
+            for pair in self.retained_bands_hz:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise ValueError(f"Invalid retained_bands_hz entry: {pair!r}")
+                lo_v, hi_v = pair[0], pair[1]
+                if not (_is_real_number(lo_v) and _is_real_number(hi_v)):
+                    raise ValueError(f"Band endpoints must be real numbers, got {pair!r}")
+                lo_f, hi_f = float(lo_v), float(hi_v)
+                if lo_f < 0.0 or lo_f > hi_f or hi_f > nyquist:
+                    raise ValueError(
+                        f"Retained band [{lo_f}, {hi_f}] Hz violates [0, Nyquist={nyquist}] Hz"
+                    )
+                if self.speech_band_dropped and not (
+                    hi_f <= SPEECH_BAND_HZ[0] or lo_f >= SPEECH_BAND_HZ[1]
+                ):
+                    raise ValueError(
+                        f"Retained band [{lo_f}, {hi_f}] Hz overlaps speech band {SPEECH_BAND_HZ} Hz"
+                    )
 
 
 def now_utc() -> str:

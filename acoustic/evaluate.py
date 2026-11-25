@@ -2,11 +2,15 @@
 
     python -m acoustic.fetch_dcase2023 --machines fan valve bearing
     python -m acoustic.evaluate --data data/dcase2023 --machines fan valve bearing
+    python -m acoustic.evaluate --data data/dcase2023 --streaming-window-s 2.0
 
 Training uses only normal clips from each machine's train/ folder. Test clips are
 scored and compared with their file-name labels. Metrics follow the DCASE 2023
 Task 2 rules: AUC per domain (source, target) and pAUC (max FPR 0.1) over both.
 Latency is measured on one CPU thread for one 10 s clip: read, log-mel, score.
+When `--streaming-window-s` is enabled, causal sub-window chunk latency, median
+detection delay on detected anomalies, and false-alarms per hour on normal test
+streams are also evaluated using out-of-fold conformal threshold calibration.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import platform
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -28,8 +33,8 @@ from scipy.stats import hmean  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
 from threadpoolctl import threadpool_limits  # noqa: E402
 
-from .detect import DETECTORS, featurize  # noqa: E402
-from .features import load_wav, log_mel  # noqa: E402
+from .detect import DETECTORS, POOLING_MODES, calibrate_with_mode, featurize  # noqa: E402
+from .features import SR, load_wav, log_mel  # noqa: E402
 
 
 def _require_binary_labels(y_sub: np.ndarray, split_name: str) -> None:
@@ -94,7 +99,86 @@ def _validate_machine_dirs(data: Path, machine: str):
     return train, test
 
 
-def run(data: Path, machines, detectors, drop_speech_band, latency_clips=50):
+def _evaluate_streaming_chunks(
+    det,
+    tr_mel,
+    test_paths,
+    drop_speech_band: bool,
+    window_s: float,
+    hop_s: float,
+    quantile: float = 0.99,
+) -> dict:
+    if window_s <= 0.0 or hop_s <= 0.0:
+        raise ValueError("streaming_window_s and streaming_hop_s must be > 0")
+    cal_subset = tr_mel[: min(len(tr_mel), 40)]
+    thr, _ = calibrate_with_mode(det, cal_subset, quantile=quantile, force_oof=True)
+
+    win_n = max(1, int(round(window_s * SR)))
+    hop_n = max(1, int(round(hop_s * SR)))
+    chunk_lats = []
+    delays_s = []
+    false_alarm_chunks = 0
+    normal_duration_s = 0.0
+    stream_scores = []
+
+    for p in test_paths:
+        wav = load_wav(p)
+        is_anom = "_anomaly_" in p.name
+        if wav.size <= win_n:
+            starts = [0]
+        else:
+            starts = list(range(0, wav.size - win_n + 1, hop_n))
+            if starts[-1] != wav.size - win_n:
+                starts.append(wav.size - win_n)
+
+        clip_chunk_scores = []
+        first_flag_s: Optional[float] = None
+        for s_idx in starts:
+            chunk = wav[s_idx : s_idx + win_n]
+            t0 = time.perf_counter()
+            sc = float(det.score(log_mel(chunk, drop_speech_band)))
+            chunk_lats.append(1000.0 * (time.perf_counter() - t0))
+            clip_chunk_scores.append(sc)
+            end_time_s = float(min(wav.size, s_idx + win_n)) / float(SR)
+            if sc > thr:
+                if is_anom and first_flag_s is None:
+                    first_flag_s = end_time_s
+                elif not is_anom:
+                    false_alarm_chunks += 1
+
+        if is_anom and first_flag_s is not None:
+            delays_s.append(first_flag_s)
+        if not is_anom:
+            normal_duration_s += float(wav.size) / float(SR)
+        stream_scores.append(float(max(clip_chunk_scores)))
+
+    fa_per_hour = (
+        round(3600.0 * float(false_alarm_chunks) / normal_duration_s, 3)
+        if normal_duration_s > 0.0
+        else 0.0
+    )
+    return {
+        "streaming_window_s": float(window_s),
+        "streaming_hop_s": float(hop_s),
+        "chunk_latency_ms_median": round(float(np.median(chunk_lats)), 2),
+        "chunk_latency_ms_p95": round(float(np.percentile(chunk_lats, 95)), 2),
+        "detection_delay_s_median": round(float(np.median(delays_s)), 3) if delays_s else None,
+        "false_alarms_per_hour": fa_per_hour,
+        "streaming_scores": stream_scores,
+    }
+
+
+def run(
+    data: Path,
+    machines,
+    detectors,
+    drop_speech_band,
+    latency_clips=50,
+    *,
+    pooling: str = "mean",
+    streaming_window_s: Optional[float] = None,
+    streaming_hop_s: float = 1.0,
+):
     rows = []
     with threadpool_limits(limits=1):
         for m in machines:
@@ -104,7 +188,7 @@ def run(data: Path, machines, detectors, drop_speech_band, latency_clips=50):
             te_mel = featurize(test, drop_speech_band)
             feat_s = time.perf_counter() - t0
             for name in detectors:
-                det = DETECTORS[name]()
+                det = DETECTORS[name](pooling=pooling)
                 t0 = time.perf_counter()
                 det.fit(tr_mel)
                 fit_s = time.perf_counter() - t0
@@ -118,6 +202,7 @@ def run(data: Path, machines, detectors, drop_speech_band, latency_clips=50):
                 r.update(
                     machine=m,
                     detector=name,
+                    pooling=pooling,
                     drop_speech_band=drop_speech_band,
                     n_train=len(train),
                     n_test=len(test),
@@ -126,6 +211,20 @@ def run(data: Path, machines, detectors, drop_speech_band, latency_clips=50):
                     latency_ms_median=round(float(np.median(lat)), 1),
                     latency_ms_p95=round(float(np.percentile(lat, 95)), 1),
                 )
+                if streaming_window_s is not None:
+                    s_info = _evaluate_streaming_chunks(
+                        det,
+                        tr_mel,
+                        test,
+                        drop_speech_band=drop_speech_band,
+                        window_s=streaming_window_s,
+                        hop_s=streaming_hop_s,
+                    )
+                    s_metrics = metrics([p.name for p in test], s_info.pop("streaming_scores"))
+                    r.update(
+                        s_info,
+                        streaming_pauc=round(float(s_metrics["pauc"]), 4),
+                    )
                 rows.append(r)
                 print(json.dumps(r), flush=True)
     return rows
@@ -146,13 +245,24 @@ def main(argv=None) -> int:
     ap.add_argument("--machines", nargs="+", default=["fan", "valve", "bearing"])
     ap.add_argument("--detectors", nargs="+", default=list(DETECTORS), choices=list(DETECTORS))
     ap.add_argument("--speech-band", choices=["keep", "drop", "both"], default="both")
+    ap.add_argument("--pooling", choices=list(POOLING_MODES), default="mean")
+    ap.add_argument("--streaming-window-s", type=float, default=None, help="Optional causal streaming window in seconds")
+    ap.add_argument("--streaming-hop-s", type=float, default=1.0, help="Causal streaming hop in seconds")
     ap.add_argument("--out", type=Path, default=Path("results/dcase2023_cpu.json"))
     args = ap.parse_args(argv)
     modes = {"keep": [False], "drop": [True], "both": [False, True]}[args.speech_band]
     rows = []
     try:
         for mode in modes:
-            rows += run(args.data, args.machines, args.detectors, mode)
+            rows += run(
+                args.data,
+                args.machines,
+                args.detectors,
+                mode,
+                pooling=args.pooling,
+                streaming_window_s=args.streaming_window_s,
+                streaming_hop_s=args.streaming_hop_s,
+            )
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -160,6 +270,8 @@ def main(argv=None) -> int:
         "dataset": "DCASE 2023 Task 2 dev (Zenodo 7882613, CC BY 4.0)",
         "cpu": platform.processor() or platform.machine(),
         "threads": 1,
+        "pooling": args.pooling,
+        "speech_band_filter_mode": "full_hann_skirt_plus_pre_stft_notch",
         "rows": rows,
         "summary": summary(rows),
     }
