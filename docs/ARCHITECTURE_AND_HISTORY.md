@@ -56,11 +56,29 @@ Defined in `acoustic/record.py` (`AudioEvent` dataclass) on `origin/acoustic-ano
 - Defaults & privacy metadata: `sample_rate_hz: int = 16000`, `mic: str = "unknown"` (e.g., `"contact"`, `"near-field"`, `"room"`), `features_path: Optional[str] = None`, `speech_band_dropped: bool = True`, `raw_audio_kept: bool = False`, `notes: str = ""`, `schema: str = "lab-ears/audio-event/v1"`.
 - Derived field serialized in `to_json()`: `"flagged": score > threshold` (stripped on `from_json()` round-trip).
 
-### 2.3 Curated Reference Datasets
+### 2.3 Curated Reference Datasets & `OpenSensoryDataset` Registry (`acoustic/open_datasets.py`)
 
-`README.md` catalogs external datasets for protocol understanding, machine acoustics, and ASR with explicit commercial-use warnings:
-- **Permissive / Share-Alike**: WLP (`MIT`), LAB-Bench (`CC BY-SA 4.0`), DCASE 2023 Task 2 dev (`CC BY 4.0`), MIMII (`CC BY-SA 4.0`), LibriSpeech (`CC BY 4.0`), Common Voice (`CC0`), `protocols.io` (per-protocol, typically `CC BY`).
-- **Restricted / Unlicensed**: BioProBench (`CC BY-NC 4.0`, **non-commercial** research only), BioProt / BioPlanner (no license file; verify before use).
+`acoustic/open_datasets.py` and `scripts/fetch_open_datasets.py` expose a typed `OpenSensoryDataset` registry (`OPEN_SENSORY_DATASETS`, 12 datasets beyond WLP-2018 and DCASE-2023, 8 released/updated in 2024-2026) with live-verified URLs, published Zenodo MD5 checksums, SPDX identifiers, and fail-closed `commercial_use_ok` guards:
+
+- **Permissive / Share-Alike (`commercial_use_ok=True`)**:
+  - `lab_bench_protocolqa` (`protocol_text`, `CC-BY-SA-4.0`, FutureHouse `futurehouse/lab-bench`, 2024-2026)
+  - `chembench` (`protocol_text`, `MIT`, `jablonkagroup/ChemBench`, 2026)
+  - `imad_ds_2024` (`machine_audio`, `16000 Hz`, `CC-BY-SA-4.0`, Zenodo `12665499`, 2024 wafer-handling robotic arm & brushless motor)
+  - `mimii` (`machine_audio`, `16000 Hz` 8-channel, `CC-BY-SA-4.0`, Zenodo `3384388`, industrial `fan`, `pump`, `slider`, `valve` across `-6`/`0`/`+6 dB` SNR)
+  - Plus reference baselines: WLP (`MIT`), DCASE 2023 Task 2 dev (`CC-BY-4.0`, Zenodo `7882613`), LibriSpeech (`CC-BY-4.0`), Common Voice (`CC0-1.0`).
+- **Non-Commercial / Unlicensed (`commercial_use_ok=False`)**:
+  - `dcase2024_task2_dev` (`machine_audio`, `16000 Hz`, `CC-BY-NC-SA-4.0`, Zenodo `10902294`, 2024 First-Shot ASD with hidden attributes)
+  - `dcase2025_task2_dev` (`machine_audio`, `16000 Hz`, `CC-BY-NC-SA-4.0`, Zenodo `15097779`, 2025 First-Shot ASD with supplemental clips)
+  - `dcase2026_task2_dev` (`machine_audio`, `16000 Hz`, `CC-BY-NC-SA-4.0`, Zenodo `19336329`, 2026 Noise-Aware Two-Channel ASD)
+  - `mimii_dg` (`machine_audio`, `16000 Hz`, `CC-BY-NC-SA-4.0` per Conditions of Use text on Zenodo `6529888`)
+  - `toyadmos2` (`machine_audio`, `48000 Hz`, `LicenseRef-ToyADMOS2-NC`, Zenodo `4580270`)
+  - `bioprobench` (`protocol_text`, `CC-BY-NC-4.0`, `BioProBench/BioProBench`, ICML 2026)
+  - `bioplanner_bioprot` (`protocol_text`, `NOASSERTION`, `bioplanner/bioplanner`, 2024)
+  - `protoact_biop2e` (`protocol_text`, `NOASSERTION`, `gjm112233/ProtoAct`, 2026)
+
+**Ingestion Loaders & Invariants**:
+- `load_dcase_task2_clips()`, `load_mimii_clips()`, and `load_acoustic_manifest()` enforce `verify_audio_privacy_and_nyquist()` on every clip: `[300, 3400] Hz` Hann-skirt speech-band excision (`drop_speech_band=True`, `raw_audio_kept=False`), source/target Nyquist bounds (`source_sr_hz >= 16000` unless `allow_upsample=True`), multi-channel-to-mono averaging (2-ch DCASE 2026 and 8-ch MIMII), and one-class normal-only `train` validation.
+- `normalize_protocol_corpus_to_jsonl()` and `load_protocol_jsonl()` normalize LAB-Bench, BioProBench (`PQA`/`ERR`/`ORD`/`GEN`), BioPlanner (`bioprot/*.json`), and generic JSONL corpora into `ProtocolSpanRecord` objects populated via `demo.parse_protocol.parse_quantities(..., include_concentration=True)`.
 
 ---
 
@@ -143,6 +161,8 @@ All three detectors implement `.fit(mels)` on normal clips only and `.score(mel)
 |---|---|---|---|
 | `2026-11-18 01:35:42 -0800` | `ba743be` (`ba743beff43aeebac7f08c8183fccfe75f5b075f`) | `main` | **Initial baseline (`Add curated resources and first demo`)**: Added zero-dependency WLP regex parser (`demo/parse_protocol.py`), recorded 125-protocol WLP test evaluation (`demo/output.txt`), added GitHub Actions CI (`.github/workflows/demo.yml`), and curated protocol/ASR datasets, open-source repositories, and papers in `README.md`. |
 | `2026-11-18 02:04:02 -0800` | `5476541` (`5476541d0c6f128e46aa61b9df2495a9b2a5df73`) | `origin/acoustic-anomaly` (open PR branch off `ba743be`) | **Acoustic anomaly baseline (`Add machine sound anomaly detection baseline`)**: Added `acoustic/` package (`features.py`, `detect.py`, `evaluate.py`, `fetch_dcase2023.py`, `record.py`, `requirements.txt`), single-thread CPU benchmark results on DCASE 2023 Task 2 (`results/dcase2023_cpu.json`), synthetic knock unit tests (`tests/test_acoustic.py`), and the `acoustic` CI job in `.github/workflows/demo.yml`. |
+| `2026-11-25` | `d3ba222` | `main` (PR #34) | **Phase 2 audit hardening & `autolab-wire/v1` integration**: Added `autolab_wire.py`, Lean 4 voice-privacy & cross-modal interlock proofs (`lean/LabEarsLean.lean`), out-of-fold conformal threshold calibration, non-pickle detector bundles, and Hann-skirt + pre-STFT `[300, 3400] Hz` speech-band drop. |
+| `2026-11-25` | `HEAD` | `feat/open-datasets-2026` | **2024-2026+ Open Sensory Datasets Registry & Loaders**: Added `acoustic/open_datasets.py`, `scripts/fetch_open_datasets.py`, and `tests/test_open_datasets_2026.py` covering 12 live-verified machine-audio and wet-lab protocol text datasets (DCASE 2024/2025/2026 Task 2, IMAD-DS 2024, MIMII, MIMII DG, ToyADMOS2, LAB-Bench ProtocolQA, ChemBench, BioProBench, BioPlanner, ProtoAct) with `[300, 3400] Hz` speech-band/Nyquist WAV loaders and JSONL `parse_quantities()` adapters. |
 
 ---
 
