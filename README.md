@@ -92,19 +92,39 @@ The timestamp, protocol id and step tie each sound to the step that was running,
 
 ## Datasets
 
-| Dataset | What | License |
-|---|---|---|
-| [Wet Lab Protocols (WLP)](https://github.com/chaitanya2334/WLP-Dataset) | 622 protocols annotated with actions, reagents, amounts, links | MIT |
-| [BioProt (BioPlanner)](https://github.com/bioplanner/bioplanner) | Protocols as pseudocode for planning evaluation | No license file - check before use |
-| [BioProBench](https://huggingface.co/datasets/BioProBench/BioProBench) | Protocol QA, step ordering, error correction, generation | CC BY-NC 4.0 (**non-commercial**) |
-| [LAB-Bench](https://huggingface.co/datasets/futurehouse/lab-bench) | Biology research tasks incl. ProtocolQA | CC BY-SA 4.0 |
-| [protocols.io](https://www.protocols.io/) | Large open protocol repository | Per protocol, often CC BY - check each |
-| [DCASE 2023 Task 2 dev](https://zenodo.org/records/7882613) | Normal and anomalous machine sounds, 7 machine types, domain shift | CC BY 4.0 |
-| [MIMII](https://zenodo.org/records/3384388) | Pump, fan, valve, slide-rail sounds at three noise levels (7-11 GB per file) | CC BY-SA 4.0 |
-| [LibriSpeech](https://www.openslr.org/12) | ~1000 h read English speech for ASR | CC BY 4.0 |
-| [Common Voice](https://commonvoice.mozilla.org/) | Crowd-sourced multilingual speech | CC0 |
+| Dataset | Registry ID | Channel / Year | What | License (`commercial_use_ok`) |
+|---|---|---|---|---|
+| [Wet Lab Protocols (WLP)](https://github.com/chaitanya2334/WLP-Dataset) | *(pinned baseline)* | `protocol_text` (2018) | 622 protocols annotated with actions, reagents, amounts, links | `MIT` (`True`) |
+| [LAB-Bench ProtocolQA](https://huggingface.co/datasets/futurehouse/lab-bench) | `lab_bench_protocolqa` | `protocol_text` (2024) | Wet-lab biology protocol troubleshooting & parameter QA | `CC-BY-SA-4.0` (`True`) |
+| [ChemBench](https://huggingface.co/datasets/jablonkagroup/ChemBench) | `chembench` | `protocol_text` (2026) | Chemical synthesis, stoichiometry, analytical procedures & lab safety | `MIT` (`True`) |
+| [BioProBench](https://huggingface.co/datasets/BioProBench/BioProBench) | `bioprobench` | `protocol_text` (2026) | 22,413 wet-lab protocols across PQA, step ordering, error correction & generation | `CC-BY-NC-4.0` (`False`, **non-commercial**) |
+| [BioProt (BioPlanner)](https://github.com/bioplanner/bioplanner) | `bioplanner_bioprot` | `protocol_text` (2024) | `protocols.io` procedures paired with executable planning pseudocode | `NOASSERTION` (`False`, check before use) |
+| [ProtoAct (BioP2E)](https://github.com/gjm112233/ProtoAct) | `protoact_biop2e` | `protocol_text` (2026) | Cell-culture SOPs aligned to state-aware robot action sequences | `NOASSERTION` (`False`, check before use) |
+| [protocols.io](https://www.protocols.io/) | - | `protocol_text` | Large open protocol repository | Per protocol, often `CC-BY-4.0` |
+| [DCASE 2023 Task 2 dev](https://zenodo.org/records/7882613) | *(CPU baseline)* | `machine_audio` (2023) | Normal and anomalous 16 kHz machine sounds, 7 machine types, domain shift | `CC-BY-4.0` (`True`) |
+| [DCASE 2024 Task 2 dev](https://zenodo.org/records/10902294) | `dcase2024_task2_dev` | `machine_audio` (2024) | First-shot 16 kHz ASD across 7 machines with hidden operational attributes | `CC-BY-NC-SA-4.0` (`False`, **non-commercial**) |
+| [DCASE 2025 Task 2 dev](https://zenodo.org/records/15097779) | `dcase2025_task2_dev` | `machine_audio` (2025) | First-shot 16 kHz 10-12 s ASD across 7 machines + supplemental clean/noise clips | `CC-BY-NC-SA-4.0` (`False`, **non-commercial**) |
+| [DCASE 2026 Task 2 dev](https://zenodo.org/records/19336329) | `dcase2026_task2_dev` | `machine_audio` (2026) | Noise-aware two-channel 16 kHz near/far-field machine ASD | `CC-BY-NC-SA-4.0` (`False`, **non-commercial**) |
+| [IMAD-DS (2024)](https://zenodo.org/records/12665499) | `imad_ds_2024` | `machine_audio` (2024) | 16 kHz analog mic + 6.7 kHz IMU on wafer-handling robotic arm & brushless motor | `CC-BY-SA-4.0` (`True`) |
+| [MIMII](https://zenodo.org/records/3384388) | `mimii` | `machine_audio` (2019) | 8-channel 16 kHz pump, fan, valve & slide-rail sounds at `-6`, `0`, `+6 dB` SNR | `CC-BY-SA-4.0` (`True`) |
+| [MIMII DG](https://zenodo.org/records/6529888) | `mimii_dg` | `machine_audio` (2022) | 16 kHz domain-generalization sounds across bearing, fan, gearbox, slider & valve | `CC-BY-NC-SA-4.0` (`False`, **non-commercial**) |
+| [ToyADMOS2](https://zenodo.org/records/4580270) | `toyadmos2` | `machine_audio` (2021) | 48 kHz multi-mic miniature-machine operating sounds under domain shift | `LicenseRef-ToyADMOS2-NC` (`False`, **non-commercial**) |
+| [LibriSpeech](https://www.openslr.org/12) | - | speech ASR | ~1000 h read English speech for ASR | `CC-BY-4.0` |
+| [Common Voice](https://commonvoice.mozilla.org/) | - | speech ASR | Crowd-sourced multilingual speech | `CC0-1.0` |
 
-Licenses marked **non-commercial** are fine for research but not for products.
+Licenses marked **non-commercial** (`commercial_use_ok=False`) are fine for research benchmarks but blocked when `--require-commercial-ok` is enabled.
+
+### On-Demand Open Dataset Registry & Loaders (`acoustic/open_datasets.py`)
+
+External WAV archives and protocol JSON/JSONL corpora are fetched on demand into gitignored `data/<dataset_id>/` (with MD5 verification and Zip-Slip protection) and loaded through speech-band-stripped (`[300, 3400] Hz` excised, Nyquist-checked) or `parse_quantities()` adapters:
+
+```bash
+python scripts/fetch_open_datasets.py --list --min-year 2024
+python scripts/fetch_open_datasets.py --verify-urls
+python scripts/fetch_open_datasets.py --dataset lab_bench_protocolqa --require-commercial-ok
+python scripts/fetch_open_datasets.py --dataset mimii --machines pump --snr-db 0 --require-commercial-ok
+python scripts/fetch_open_datasets.py --dataset dcase2025_task2_dev --machines fan valve
+```
 
 ## Open-source repos
 
@@ -158,7 +178,7 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 `lab-ears` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L2 · Auditory & Protocol Sensory Cortex`**.
 
 - **Object**: Sensory ingestion layer that extracts and normalizes quantitative parameters (`Amount`, `Temperature`, `Time`, `Speed`, plus optional `Concentration`) from wet-lab protocol prose and monitors benchtop machine audio for unsupervised acoustic anomalies with speech-band privacy filtering.
-- **Data**: Wet Lab Protocols (WLP) 125-protocol BRAT test split (MIT, pinned at `1f51ae6e620a5aa3590acf725713f430783f56d7`); DCASE 2023 Task 2 `16 kHz` machine audio (`fan`, `valve`, `bearing`, CC BY 4.0, MD5-verified Zenodo record `7882613`) and `lab-ears/audio-event/v1` JSONL ledger schema.
+- **Data**: Wet Lab Protocols (WLP) 125-protocol BRAT test split (MIT, pinned at `1f51ae6e620a5aa3590acf725713f430783f56d7`); DCASE 2023 Task 2 `16 kHz` machine audio (`fan`, `valve`, `bearing`, CC BY 4.0, MD5-verified Zenodo record `7882613`); 12 typed open sensory datasets (`OPEN_SENSORY_DATASETS`, 2024-2026+ DCASE 2024/2025/2026 Task 2, IMAD-DS 2024, MIMII, MIMII DG, ToyADMOS2, LAB-Bench ProtocolQA, ChemBench, BioProBench, BioPlanner, ProtoAct); and `lab-ears/audio-event/v1` JSONL ledger schema.
 - **Model**: Stdlib regex span extractor with contextual `Speed`-vs-`Amount` mass disambiguation, canonical unit normalizer (`parse_quantities`), and 1-to-1 bipartite overlap scorer (`demo/parse_protocol.py`); 64-bin HTK log-mel frontend (strict `[lo_hz, hi_hz]` `300–3400 Hz` speech-band filter exclusion) paired with unsquared Mahalanobis Ledoit-Wolf `GaussianDetector`, few-shot-safe `KNNDetector(k=5)`, and 5-frame `AutoencoderDetector` (`128-128-8-128-128`).
 - **Training**: Rule-based zero-parameter baseline on WLP (`0.798–0.909` exact F1, `0.821–0.937` overlap F1); strictly one-class normal-only fitting (`1,000` clips/machine) on DCASE 2023 (`0.555` fullband / `0.496` speech-dropped harmonic mean for autoencoder) plus quantile threshold calibration (`calibrate_threshold`).
 - **History**: `ba743be` (2026-11-18, `main` WLP protocol parser & curated resources) -> `5476541` (2026-11-18, `acoustic-anomaly` DCASE 2023 acoustic baseline & privacy event schema) -> merged and hardened with full offline test coverage, canonical quantity normalization, and live `acoustic.monitor` JSONL emission.
@@ -188,6 +208,7 @@ lab-ears/
 │   ├── features.py               # Dtype-aware WAV loader, zero-copy log-mel, speech-band mask
 │   ├── fetch_dcase2023.py        # Timeout + MD5 + Zip-Slip-guarded Zenodo downloader
 │   ├── monitor.py                # CLI/API emitting calibrated AudioEvent JSONL lines
+│   ├── open_datasets.py          # Typed 2024-2026+ OpenSensoryDataset registry & WAV/JSONL loaders
 │   ├── record.py                 # Validated lab-ears/audio-event/v1 ledger schema
 │   └── requirements.txt          # numpy, scipy, scikit-learn, threadpoolctl, pytest
 ├── community_extensions/
@@ -201,10 +222,13 @@ lab-ears/
 │   └── LabEarsLean.lean          # Lean 4 voice-privacy & cross-modal interlock proofs
 ├── results/
 │   └── dcase2023_cpu.json        # Reference single-thread CPU DCASE 2023 evaluation
+├── scripts/
+│   └── fetch_open_datasets.py    # On-demand MD5 + Zip-Slip-guarded open dataset downloader
 ├── tests/
 │   ├── test_acoustic.py          # Synthetic unit tests for acoustic features, detectors & ledger
 │   ├── test_autolab_wire.py      # Unit tests for autolab-wire/v1 packet processing & privacy block
 │   ├── test_community_extensions.py
+│   ├── test_open_datasets_2026.py # Registry, DCASE 2024-2026/MIMII WAV & protocol JSONL tests
 │   └── test_parse_protocol.py    # Offline unit tests for protocol span extraction & normalization
 ├── autolab_wire.py               # L2 autolab-wire/v1 node (protocol spans + speech-band gate)
 ├── LICENSE                       # MIT License
