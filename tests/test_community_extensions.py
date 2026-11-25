@@ -22,6 +22,7 @@ from community_extensions import (  # noqa: E402
 from community_extensions.cross_modal_interlock import (  # noqa: E402
     HIGH_CAVITATION_BAND_HZ,
     LOW_STALL_BAND_HZ,
+    _synthesize_pipetting_clip,
     verify_privacy_bands,
 )
 
@@ -124,3 +125,63 @@ def test_benchmark_120_clips_speech_resilience_and_f1() -> None:
     rms_det = SpeechUnfilteredRMSDetector()
     rms_det.calibrate([np.zeros(800, dtype=np.float64)])
     assert rms_det.evaluate(np.ones(800, dtype=np.float64), PipettingCommandWindow(0, "aspirate", 0.0, 0.05)).halt_run
+
+
+# --- Issue #29 & #30: High sample rates (44.1/48 kHz), NaN/Inf rejection, tail padding & Nyquist ---
+@pytest.mark.parametrize("sr", [16000, 44100, 48000])
+def test_issue29_high_sample_rate_stepper_stall_and_cavitation_halts(sr: int) -> None:
+    rng = np.random.default_rng(42 + sr)
+    calib = [_synthesize_pipetting_clip(rng, i, "nominal", False, "aqueous", sample_rate_hz=sr) for i in range(6)]
+    det = CrossModalInterlockDetector(sample_rate_hz=sr)
+    det.calibrate(calib)
+    assert np.isfinite(det.base_lo_power) and det.base_lo_power > 0.0
+    assert np.isfinite(det.base_hi_power) and det.base_hi_power > 0.0
+
+    stall_wav, stall_cmd = _synthesize_pipetting_clip(
+        rng, 99, "stepper_stall", True, "aqueous", sample_rate_hz=sr
+    )
+    stall_dec = det.evaluate(stall_wav, stall_cmd)
+    assert np.isfinite(stall_dec.stall_ratio)
+    assert stall_dec.halt_run is True
+    assert "stall" in stall_dec.reason
+
+    cav_wav, cav_cmd = _synthesize_pipetting_clip(
+        rng, 100, "dry_aspiration", True, "aqueous", sample_rate_hz=sr
+    )
+    cav_dec = det.evaluate(cav_wav, cav_cmd)
+    assert np.isfinite(cav_dec.cavitation_ratio)
+    assert cav_dec.halt_run is True
+    assert "cavitation" in cav_dec.reason
+    wire_d = cav_dec.to_wire_dict()
+    assert wire_d["halt_run"] is True and wire_d["raw_audio_saved"] is False
+
+
+def test_issue29_nan_inf_nyquist_and_trailing_subhop_padding() -> None:
+    for bad_val in (np.nan, np.inf, -np.inf):
+        bad = np.zeros(2048, dtype=np.float64)
+        bad[50] = bad_val
+        with pytest.raises(ValueError, match="NaN or Inf"):
+            extract_voice_stripped_band_energies(bad, sample_rate_hz=16000)
+
+    # 8 kHz cannot observe [3600, 7800] Hz cavitation above 4 kHz Nyquist
+    with pytest.raises(ValueError, match="Nyquist|insufficient"):
+        CrossModalInterlockDetector(sample_rate_hz=8000)
+    with pytest.raises(ValueError, match="Nyquist"):
+        extract_voice_stripped_band_energies(np.zeros(2048), sample_rate_hz=8000)
+
+    # Explicit coarse n_fft leaving low band empty raises ValueError rather than NaN
+    with pytest.raises(ValueError, match="Empty STFT band mask"):
+        extract_voice_stripped_band_energies(np.zeros(2048), sample_rate_hz=48000, n_fft=512, hop_length=160)
+
+    # Trailing sub-hop cavitation burst must be preserved via right-padding
+    sr = 16000
+    n_samples = 512 + 3 * 160 + 90
+    t_tail = np.arange(90, dtype=np.float64) / sr
+    x_quiet = np.zeros(n_samples, dtype=np.float64)
+    x_burst = np.zeros(n_samples, dtype=np.float64)
+    x_burst[-90:] = 0.5 * np.sin(2.0 * np.pi * 6000.0 * t_tail)
+    f_q = extract_voice_stripped_band_energies(x_quiet, sample_rate_hz=sr)
+    f_b = extract_voice_stripped_band_energies(x_burst, sample_rate_hz=sr)
+    assert f_b.hi_band_power.shape[0] == 5
+    assert f_b.hi_band_power[-1] > f_q.hi_band_power[-1] + 1e-4
+

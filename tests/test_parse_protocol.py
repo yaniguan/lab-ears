@@ -256,3 +256,55 @@ def test_parse_quantities_canonical_normalization():
     q_rpm = qs["3000 rpm"]
     assert q_rpm.canonical_unit == "rpm"
     assert q_rpm.canonical_value == pytest.approx(3000.0)
+
+
+# --- Issue #28: Phantom Concentration in 'x g', comma decimals, scientific notation & fM ---
+def test_issue28_no_phantom_concentration_inside_xg_speed():
+    qs = parse_quantities("Centrifuge at 12000 x g for 5 min.")
+    assert [(q.label, q.raw, q.canonical_value, q.canonical_unit) for q in qs] == [
+        ("Speed", "12000 x g", 12000.0, "xg"),
+        ("Time", "5 min", 300.0, "s"),
+    ]
+    qs_comma = parse_quantities("Pellet cells at 12,000 x g after diluting 10X buffer to 1X.")
+    assert [(q.label, q.raw, q.canonical_unit) for q in qs_comma] == [
+        ("Speed", "12,000 x g", "xg"),
+        ("Concentration", "10X", "X"),
+        ("Concentration", "1X", "X"),
+    ]
+
+
+def test_issue28_european_comma_decimals_vs_thousands_grouping():
+    qs = {q.raw: q for q in parse_quantities("Add 0,500 mL buffer, 0,250 g agarose, and 1,500 uL water.")}
+    assert qs["0,500 mL"].canonical_unit == "uL"
+    assert qs["0,500 mL"].canonical_value == pytest.approx(500.0)
+    assert qs["0,250 g"].canonical_unit == "mg"
+    assert qs["0,250 g"].canonical_value == pytest.approx(250.0)
+    assert qs["1,500 uL"].canonical_unit == "uL"
+    assert qs["1,500 uL"].canonical_value == pytest.approx(1500.0)
+
+
+def test_issue28_scientific_notation_signed_temp_ranges_and_femtomolar():
+    qs1 = parse_quantities("Add 1.5 x 10^6 cells in 2e-3 L media and warm from -20 to +4 °C.")
+    assert [(q.label, q.raw) for q in qs1] == [
+        ("Amount", "2e-3 L"),
+        ("Temperature", "-20 to +4 °C"),
+    ]
+    assert qs1[0].canonical_unit == "uL"
+    assert qs1[0].canonical_value == pytest.approx(2000.0)
+    assert qs1[1].canonical_unit == "C"
+    assert qs1[1].canonical_min == pytest.approx(-20.0)
+    assert qs1[1].canonical_max == pytest.approx(4.0)
+    assert qs1[1].canonical_value == pytest.approx(-8.0)
+
+    qs2 = {
+        q.raw: q
+        for q in parse_quantities("Dilute probe to 10 fM in 1e-3 M Tris and spin at 2.5e4 rpm.")
+    }
+    assert qs2["10 fM"].canonical_unit == "mM"
+    assert qs2["10 fM"].canonical_value == pytest.approx(1e-11)
+    assert qs2["1e-3 M"].canonical_unit == "mM"
+    assert qs2["1e-3 M"].canonical_value == pytest.approx(1.0)
+    assert qs2["2.5e4 rpm"].canonical_unit == "rpm"
+    assert qs2["2.5e4 rpm"].canonical_value == pytest.approx(25000.0)
+    assert ("Temperature", "13C") not in _extract_texts("Verify product by 13C NMR spectrum.")
+

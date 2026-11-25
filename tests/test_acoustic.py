@@ -17,6 +17,9 @@ from acoustic.detect import (
     GaussianDetector,
     KNNDetector,
     calibrate_threshold,
+    calibrate_with_mode,
+    load_detector_bundle,
+    save_detector_bundle,
 )
 from acoustic.evaluate import main as evaluate_main, metrics as evaluate_metrics, run as evaluate_run
 from acoustic.features import (
@@ -29,11 +32,13 @@ from acoustic.features import (
     _FB,
     load_wav,
     log_mel,
+    outward_round_band_hz,
+    retained_mel_bands_hz,
     speech_band_mask,
     stack_frames,
 )
 from acoustic.fetch_dcase2023 import ZENODO_MD5, fetch, safe_extract_zip, verify_digest
-from acoustic.monitor import main as monitor_main, monitor_clip
+from acoustic.monitor import main as monitor_main, monitor_clip, monitor_stream
 from acoustic.record import SCHEMA, AudioEvent, now_utc
 
 
@@ -367,3 +372,187 @@ def test_calibrate_threshold_and_monitor_cli(tmp_path: Path):
     parsed = [AudioEvent.from_json(line) for line in lines]
     assert [p.step for p in parsed] == [1, 2]
     assert parsed[1].flagged is True
+
+
+# --- Issue #30: Pre-STFT speech notch >= 60 dB attenuation & outward frequency rounding ---
+def test_issue30_hann_skirt_notch_60db_attenuation_and_outward_rounding():
+    assert outward_round_band_hz(50.0, 300.4) == (50, 301)
+    assert outward_round_band_hz(3399.6, 7800.0) == (3399, 7800)
+    assert retained_mel_bands_hz(drop_speech_band=True) == [[0, 255], [3464, 8000]]
+
+    t = np.arange(SR) / SR
+    for f_hz in (310.0, 3390.0):
+        speech_tone = (0.8 * np.sin(2.0 * np.pi * f_hz * t)).astype(np.float32)
+        m_full = log_mel(speech_tone, drop_speech_band=False)
+        m_drop = log_mel(speech_tone, drop_speech_band=True)
+        assert (m_full.max() - m_drop.max()) >= 60.0
+
+
+# --- Issue #33: Out-of-fold conformal calibration, causal sub-window pooling, bundles & streaming ---
+def test_issue33_oof_conformal_calibration_prevents_false_alarms():
+    rng = np.random.default_rng(0)
+    train_mels = [log_mel(0.02 * rng.standard_normal(SR).astype(np.float32), drop_speech_band=True) for _ in range(10)]
+    heldout_mels = [log_mel(0.02 * rng.standard_normal(SR).astype(np.float32), drop_speech_band=True) for _ in range(50)]
+
+    for det in (
+        GaussianDetector().fit(train_mels),
+        KNNDetector(k=5).fit(train_mels),
+        AutoencoderDetector(hidden=(16, 4, 16), epochs=15, seed=0).fit(train_mels),
+    ):
+        thr, mode = calibrate_with_mode(det, train_mels, quantile=0.99)
+        assert mode == "oof_conformal"
+        fpr = float(np.mean([det.score(m) > thr for m in heldout_mels]))
+        assert fpr <= 0.05
+
+
+def test_issue33_sliding_window_pooling_catches_brief_fault_in_60s_step():
+    rng = np.random.default_rng(3)
+    tr2 = [log_mel(0.03 * rng.standard_normal(2 * SR).astype(np.float32)) for _ in range(12)]
+    va2 = [log_mel(0.03 * rng.standard_normal(2 * SR).astype(np.float32)) for _ in range(20)]
+
+    x2 = 0.03 * rng.standard_normal(2 * SR).astype(np.float32)
+    x2[1000 : 1000 + int(0.15 * SR)] += 0.5
+    x60 = 0.03 * rng.standard_normal(60 * SR).astype(np.float32)
+    x60[1000 : 1000 + int(0.15 * SR)] += 0.5
+    m2, m60 = log_mel(x2), log_mel(x60)
+
+    for det in (
+        AutoencoderDetector(hidden=(32, 8, 32), epochs=20, seed=0).fit(tr2),
+        GaussianDetector().fit(tr2),
+        KNNDetector(k=5).fit(tr2),
+    ):
+        thr = calibrate_threshold(det, va2, quantile=0.99)
+        assert det.score(m2) > thr
+        assert det.score(m60) > thr
+
+
+def test_issue33_non_pickle_bundle_upsample_guard_and_streaming(tmp_path: Path):
+    rng = np.random.default_rng(21)
+    norm_dir = tmp_path / "norm"
+    norm_dir.mkdir()
+    for i in range(6):
+        wavfile.write(norm_dir / f"n_{i}.wav", SR, _clip(rng, knock=False, seconds=0.6))
+
+    knock_wav = tmp_path / "knock.wav"
+    wavfile.write(knock_wav, SR, _clip(rng, knock=True, seconds=0.6))
+
+    # Fit & persist each detector via CLI --save-model, then score via --load-model without retraining
+    for det_name in ("gaussian", "knn", "autoencoder"):
+        bundle_path = tmp_path / f"{det_name}_bundle.npz"
+        assert (
+            monitor_main(
+                [
+                    "--train-dir",
+                    str(norm_dir),
+                    "--detector",
+                    det_name,
+                    "--save-model",
+                    str(bundle_path),
+                ]
+            )
+            == 0
+        )
+        assert bundle_path.is_file() and bundle_path.with_suffix(".json").is_file()
+        loaded_det, meta = load_detector_bundle(bundle_path)
+        assert meta["calibration_mode"] == "oof_conformal"
+        assert meta["drop_speech_band"] is True
+
+        out_jsonl = tmp_path / f"{det_name}_events.jsonl"
+        assert (
+            monitor_main(
+                [
+                    "--load-model",
+                    str(bundle_path),
+                    "--wav",
+                    str(knock_wav),
+                    "--protocol-id",
+                    "pcr-v3",
+                    "--step",
+                    "3",
+                    "--instrument-id",
+                    "pump-01",
+                    "--out-jsonl",
+                    str(out_jsonl),
+                ]
+            )
+            == 0
+        )
+        ev = AudioEvent.from_json(out_jsonl.read_text(encoding="utf-8").strip())
+        assert ev.flagged is True
+        assert ev.score == pytest.approx(loaded_det.score(log_mel(load_wav(knock_wav), drop_speech_band=True)))
+
+    # Reject silent upsampling from 8 kHz while recording source_sample_rate_hz on 32 kHz downsample
+    low_sr_wav = tmp_path / "sr8k.wav"
+    wavfile.write(low_sr_wav, 8000, np.zeros(4000, dtype=np.float32))
+    g_det, g_meta = load_detector_bundle(tmp_path / "gaussian_bundle.npz")
+    with pytest.raises(ValueError, match="below minimum required 16000 Hz"):
+        monitor_clip(
+            low_sr_wav,
+            g_det,
+            threshold=g_meta["threshold"],
+            protocol_id="p",
+            step=0,
+            instrument_id="i",
+            resample=True,
+        )
+
+    hi_sr_wav = tmp_path / "sr32k_ok.wav"
+    wavfile.write(hi_sr_wav, 32000, _clip(rng, knock=False, seconds=1.2))
+    ev_32k = monitor_clip(
+        hi_sr_wav,
+        g_det,
+        threshold=g_meta["threshold"],
+        protocol_id="p",
+        step=0,
+        instrument_id="i",
+        resample=True,
+    )
+    assert ev_32k.sample_rate_hz == 16000
+    assert ev_32k.source_sample_rate_hz == 32000
+
+    # Causal PCM ring-buffer streaming monitor + evaluate.py streaming metrics
+    long_stream = np.concatenate([_clip(rng, knock=False, seconds=1.5), _clip(rng, knock=True, seconds=1.5)])
+    chunks = np.array_split(long_stream, 12)
+    stream_events = list(
+        monitor_stream(
+            chunks,
+            g_det,
+            threshold=g_meta["threshold"],
+            protocol_id="stream-proto",
+            step=5,
+            instrument_id="valve-01",
+            window_s=1.0,
+            hop_s=0.5,
+        )
+    )
+    assert len(stream_events) >= 4
+    assert any(e.flagged for e in stream_events)
+    assert all(e.raw_audio_kept is False and e.raw_audio_saved is False for e in stream_events)
+
+    # Verify evaluate_run streaming mode
+    m_dir = tmp_path / "dcase_stream" / "valve"
+    (m_dir / "train").mkdir(parents=True)
+    (m_dir / "test").mkdir(parents=True)
+    for i in range(6):
+        wavfile.write(m_dir / "train" / f"s0_source_train_normal_{i:04d}.wav", SR, _clip(rng, seconds=1.0))
+    for fname, is_anom in [
+        ("s0_source_test_normal_0000.wav", False),
+        ("s0_source_test_anomaly_0001.wav", True),
+        ("s0_target_test_normal_0002.wav", False),
+        ("s0_target_test_anomaly_0003.wav", True),
+    ]:
+        wavfile.write(m_dir / "test" / fname, SR, _clip(rng, knock=is_anom, seconds=1.0))
+
+    s_rows = evaluate_run(
+        tmp_path / "dcase_stream",
+        ["valve"],
+        ["gaussian"],
+        drop_speech_band=True,
+        latency_clips=2,
+        streaming_window_s=0.5,
+        streaming_hop_s=0.25,
+    )
+    assert s_rows[0]["streaming_window_s"] == pytest.approx(0.5)
+    assert s_rows[0]["chunk_latency_ms_median"] >= 0.0
+    assert s_rows[0]["false_alarms_per_hour"] >= 0.0
+

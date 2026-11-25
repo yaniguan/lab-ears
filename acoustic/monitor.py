@@ -1,10 +1,16 @@
-"""Live step acoustic monitor: fit/calibrate an anomaly detector on normal clips,
-score protocol step WAV recordings, and emit validated `lab-ears/audio-event/v1`
-JSONL ledger lines for `lab-rehearsal` and `lab-verify`.
+"""Live step acoustic monitor: fit/calibrate or load a pre-calibrated anomaly detector,
+score protocol step WAV recordings or live PCM streams, and emit validated
+`lab-ears/audio-event/v1` JSONL ledger lines for `lab-rehearsal` and `lab-verify`.
 
 Usage:
+    # Fit + out-of-fold conformal calibrate once and persist a safe non-pickle bundle:
     python -m acoustic.monitor \\
         --train-dir path/to/normal_clips \\
+        --save-model runs/centrifuge01_model.npz
+
+    # Score live protocol steps without per-step retraining:
+    python -m acoustic.monitor \\
+        --load-model runs/centrifuge01_model.npz \\
         --wav path/to/step4.wav \\
         --protocol-id pcr-setup-v2 --step 4 --instrument-id centrifuge-01 \\
         --out-jsonl runs/audio_events.jsonl
@@ -13,14 +19,22 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, Iterator, List, Optional, Sequence
 
 import numpy as np
+from scipy.signal import resample_poly
 
-from .detect import DETECTORS, calibrate_threshold
-from .features import SR, load_wav, log_mel
+from .detect import (
+    DETECTORS,
+    POOLING_MODES,
+    calibrate_with_mode,
+    load_detector_bundle,
+    save_detector_bundle,
+)
+from .features import SR, load_wav_info, log_mel, retained_mel_bands_hz
 from .record import AudioEvent, now_utc
 
 
@@ -51,13 +65,20 @@ def monitor_clip(
     mic: str = "contact",
     drop_speech_band: bool = True,
     resample: bool = False,
+    allow_upsample: bool = False,
     save_features_path: Optional[Path | str] = None,
     start_utc: Optional[str] = None,
     notes: str = "",
 ) -> AudioEvent:
     """Score one WAV clip with a fitted detector and return a validated AudioEvent."""
     wav_path = Path(wav_path)
-    x = load_wav(wav_path, target_sr=SR, resample=resample)
+    min_src_sr = None if allow_upsample else SR
+    x, src_sr = load_wav_info(
+        wav_path,
+        target_sr=SR,
+        resample=resample,
+        min_source_sr=min_src_sr,
+    )
     mel = log_mel(x, drop_speech_band=drop_speech_band)
     score = float(detector.score(mel))
 
@@ -78,14 +99,109 @@ def monitor_clip(
         score=score,
         threshold=float(threshold),
         sample_rate_hz=SR,
+        source_sample_rate_hz=src_sr,
         mic=mic,
         features_path=feat_str,
         speech_band_dropped=drop_speech_band,
         raw_audio_kept=False,
+        raw_audio_saved=False,
+        retained_bands_hz=retained_mel_bands_hz(drop_speech_band=drop_speech_band, sr=SR),
         notes=notes,
     )
     event.validate()
     return event
+
+
+def monitor_stream(
+    pcm_chunks: Iterable[np.ndarray],
+    detector,
+    *,
+    threshold: float,
+    protocol_id: str,
+    step: int,
+    instrument_id: str,
+    sample_rate_hz: int = SR,
+    window_s: float = 2.0,
+    hop_s: float = 1.0,
+    mic: str = "contact",
+    drop_speech_band: bool = True,
+    allow_upsample: bool = False,
+    flush_tail: bool = True,
+    out_jsonl: Optional[Path] = None,
+    notes: str = "",
+) -> Iterator[AudioEvent]:
+    """Causal PCM ring-buffer generator scoring live streaming chunks without raw-audio storage."""
+    src_sr = int(sample_rate_hz)
+    if src_sr <= 0:
+        raise ValueError(f"sample_rate_hz must be > 0, got {sample_rate_hz!r}")
+    if src_sr < SR and not allow_upsample:
+        raise ValueError(
+            f"Streaming source sample rate {src_sr} Hz is below {SR} Hz; upsampling cannot recover high-band faults"
+        )
+    if window_s <= 0.0 or hop_s <= 0.0 or not (math.isfinite(window_s) and math.isfinite(hop_s)):
+        raise ValueError(f"window_s ({window_s}) and hop_s ({hop_s}) must be finite and > 0")
+
+    win_samples = max(1, int(round(window_s * SR)))
+    hop_samples = max(1, int(round(hop_s * SR)))
+    ring = np.empty(0, dtype=np.float32)
+    emitted = 0
+    consumed_since_emit = 0
+
+    def _emit_window(buf: np.ndarray, idx: int) -> AudioEvent:
+        mel = log_mel(buf, drop_speech_band=drop_speech_band)
+        score = float(detector.score(mel))
+        win_note = f"stream_window={idx}" if not notes else f"{notes}; stream_window={idx}"
+        ev = AudioEvent(
+            protocol_id=protocol_id,
+            step=step,
+            instrument_id=instrument_id,
+            start_utc=now_utc(),
+            duration_s=round(float(len(buf)) / float(SR), 6),
+            detector=getattr(detector, "name", type(detector).__name__.lower()),
+            score=score,
+            threshold=float(threshold),
+            sample_rate_hz=SR,
+            source_sample_rate_hz=src_sr,
+            mic=mic,
+            features_path=None,
+            speech_band_dropped=drop_speech_band,
+            raw_audio_kept=False,
+            raw_audio_saved=False,
+            retained_bands_hz=retained_mel_bands_hz(drop_speech_band=drop_speech_band, sr=SR),
+            notes=win_note,
+        )
+        ev.validate()
+        if out_jsonl is not None:
+            out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+            with out_jsonl.open("a", encoding="utf-8") as fh:
+                fh.write(ev.to_json() + "\n")
+        return ev
+
+    for chunk in pcm_chunks:
+        arr = np.asarray(chunk, dtype=np.float32)
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1, dtype=np.float32)
+        arr = arr.ravel()
+        if arr.size == 0:
+            continue
+        if not np.isfinite(arr).all():
+            raise ValueError("Streaming PCM chunk contains NaN or Inf")
+        if src_sr != SR:
+            g = math.gcd(SR, src_sr)
+            arr = resample_poly(arr, SR // g, src_sr // g).astype(np.float32)
+
+        ring = np.concatenate([ring, arr])
+        consumed_since_emit += int(arr.size)
+
+        while ring.size >= win_samples:
+            ev = _emit_window(ring[:win_samples], emitted)
+            emitted += 1
+            consumed_since_emit = 0
+            yield ev
+            ring = ring[hop_samples:]
+
+    if flush_tail and ring.size > 0 and (emitted == 0 or consumed_since_emit > 0):
+        yield _emit_window(ring, emitted)
 
 
 def monitor_steps(
@@ -99,6 +215,7 @@ def monitor_steps(
     mic: str = "contact",
     drop_speech_band: bool = True,
     resample: bool = False,
+    allow_upsample: bool = False,
     save_features_dir: Optional[Path] = None,
     out_jsonl: Optional[Path] = None,
     notes: str = "",
@@ -123,6 +240,7 @@ def monitor_steps(
             mic=mic,
             drop_speech_band=drop_speech_band,
             resample=resample,
+            allow_upsample=allow_upsample,
             save_features_path=feat_path,
             notes=notes,
         )
@@ -142,56 +260,96 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--train-wavs", nargs="*", type=Path, default=None, help="Explicit normal calibration WAV files")
     ap.add_argument("--val-dir", type=Path, default=None, help="Optional normal validation WAV directory for threshold")
     ap.add_argument("--val-wavs", nargs="*", type=Path, default=None, help="Optional normal validation WAV files")
-    ap.add_argument("--wav", nargs="+", type=Path, required=True, help="Step WAV clip(s) to score")
+    ap.add_argument("--save-model", type=Path, default=None, help="Save calibrated detector bundle (.npz + .json)")
+    ap.add_argument("--load-model", type=Path, default=None, help="Load pre-calibrated detector bundle (.npz)")
+    ap.add_argument("--wav", nargs="*", type=Path, default=None, help="Step WAV clip(s) to score")
     ap.add_argument("--detector", choices=list(DETECTORS), default="gaussian")
+    ap.add_argument("--pooling", choices=list(POOLING_MODES), default="max_window")
     ap.add_argument("--threshold", type=float, default=None, help="Explicit threshold (overrides --quantile)")
     ap.add_argument("--quantile", type=float, default=0.99, help="Validation score quantile for threshold calibration")
-    ap.add_argument("--protocol-id", required=True)
+    ap.add_argument("--protocol-id", default="calibration-only")
     ap.add_argument("--step", type=int, default=0, help="Starting 0-based protocol step index")
-    ap.add_argument("--instrument-id", required=True)
+    ap.add_argument("--instrument-id", default="benchtop-01")
     ap.add_argument("--mic", default="contact")
     ap.add_argument("--speech-band", choices=["drop", "keep"], default="drop")
-    ap.add_argument("--resample", action="store_true", help="Resample non-16kHz WAVs to 16 kHz")
+    ap.add_argument("--resample", action="store_true", help="Resample non-16kHz WAVs (>= 16 kHz) to 16 kHz")
+    ap.add_argument("--allow-upsample", action="store_true", help="Allow resampling source WAVs recorded below 16 kHz")
     ap.add_argument("--save-features-dir", type=Path, default=None)
     ap.add_argument("--out-jsonl", type=Path, default=None, help="Append validated AudioEvent JSONL lines to file")
     ap.add_argument("--notes", default="")
     args = ap.parse_args(argv)
 
     drop_speech = args.speech_band == "drop"
+    min_src_sr = None if args.allow_upsample else SR
+
     try:
-        train_wavs = _collect_wavs(args.train_dir, args.train_wavs, "training")
-        step_wavs = _collect_wavs(None, args.wav, "step")
-        train_mels = [log_mel(load_wav(w, resample=args.resample), drop_speech_band=drop_speech) for w in train_wavs]
+        if not args.wav and args.save_model is None:
+            raise ValueError("Provide --wav step clip(s) to score and/or --save-model to persist a calibration bundle")
 
-        det = DETECTORS[args.detector]()
-        det.fit(train_mels)
-
-        if args.threshold is not None:
-            threshold = float(args.threshold)
+        if args.load_model is not None:
+            det, meta = load_detector_bundle(args.load_model)
+            loaded_drop = meta.get("drop_speech_band")
+            if loaded_drop is not None and bool(loaded_drop) != drop_speech:
+                raise ValueError(
+                    f"Loaded model bundle has drop_speech_band={loaded_drop}, which conflicts with --speech-band {args.speech_band}"
+                )
+            threshold = float(args.threshold) if args.threshold is not None else float(meta["threshold"])
+            calib_mode = "explicit" if args.threshold is not None else str(meta.get("calibration_mode", "bundle"))
         else:
-            if args.val_dir is not None or args.val_wavs:
+            train_wavs = _collect_wavs(args.train_dir, args.train_wavs, "training")
+            train_mels = [
+                log_mel(
+                    load_wav_info(w, resample=args.resample, min_source_sr=min_src_sr)[0],
+                    drop_speech_band=drop_speech,
+                )
+                for w in train_wavs
+            ]
+            det = DETECTORS[args.detector](pooling=args.pooling)
+            det.fit(train_mels)
+
+            if args.threshold is not None:
+                threshold = float(args.threshold)
+                calib_mode = "explicit"
+            elif args.val_dir is not None or args.val_wavs:
                 val_wavs = _collect_wavs(args.val_dir, args.val_wavs, "validation")
                 val_mels = [
-                    log_mel(load_wav(w, resample=args.resample), drop_speech_band=drop_speech) for w in val_wavs
+                    log_mel(
+                        load_wav_info(w, resample=args.resample, min_source_sr=min_src_sr)[0],
+                        drop_speech_band=drop_speech,
+                    )
+                    for w in val_wavs
                 ]
+                threshold, calib_mode = calibrate_with_mode(det, val_mels, quantile=args.quantile, force_oof=False)
             else:
-                val_mels = train_mels
-            threshold = calibrate_threshold(det, val_mels, quantile=args.quantile)
+                threshold, calib_mode = calibrate_with_mode(det, train_mels, quantile=args.quantile, force_oof=True)
 
-        events = monitor_steps(
-            step_wavs,
-            det,
-            threshold=threshold,
-            protocol_id=args.protocol_id,
-            start_step=args.step,
-            instrument_id=args.instrument_id,
-            mic=args.mic,
-            drop_speech_band=drop_speech,
-            resample=args.resample,
-            save_features_dir=args.save_features_dir,
-            out_jsonl=args.out_jsonl,
-            notes=args.notes,
-        )
+        if args.save_model is not None:
+            save_detector_bundle(
+                args.save_model,
+                det,
+                threshold=threshold,
+                calibration_mode=calib_mode,
+                quantile=args.quantile,
+            )
+
+        events: List[AudioEvent] = []
+        if args.wav:
+            step_wavs = _collect_wavs(None, args.wav, "step")
+            events = monitor_steps(
+                step_wavs,
+                det,
+                threshold=threshold,
+                protocol_id=args.protocol_id,
+                start_step=args.step,
+                instrument_id=args.instrument_id,
+                mic=args.mic,
+                drop_speech_band=drop_speech,
+                resample=args.resample,
+                allow_upsample=args.allow_upsample,
+                save_features_dir=args.save_features_dir,
+                out_jsonl=args.out_jsonl,
+                notes=args.notes,
+            )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
