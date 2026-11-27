@@ -22,7 +22,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence
+from typing import Any, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -30,6 +30,7 @@ from scipy.signal import resample_poly
 from .detect import (
     DETECTORS,
     POOLING_MODES,
+    calibrate_streaming_with_mode,
     calibrate_with_mode,
     load_detector_bundle,
     save_detector_bundle,
@@ -126,11 +127,18 @@ def monitor_stream(
     mic: str = "contact",
     drop_speech_band: bool = True,
     allow_upsample: bool = False,
+    allow_window_mismatch: bool = False,
+    bundle_meta: Optional[Mapping[str, Any]] = None,
     flush_tail: bool = True,
     out_jsonl: Optional[Path] = None,
     notes: str = "",
 ) -> Iterator[AudioEvent]:
     """Causal PCM ring-buffer generator scoring live streaming chunks without raw-audio storage."""
+    if isinstance(detector, tuple) and len(detector) == 2 and isinstance(detector[1], Mapping):
+        det_obj, meta_obj = detector
+    else:
+        det_obj, meta_obj = detector, bundle_meta
+
     src_sr = int(sample_rate_hz)
     if src_sr <= 0:
         raise ValueError(f"sample_rate_hz must be > 0, got {sample_rate_hz!r}")
@@ -141,15 +149,32 @@ def monitor_stream(
     if window_s <= 0.0 or hop_s <= 0.0 or not (math.isfinite(window_s) and math.isfinite(hop_s)):
         raise ValueError(f"window_s ({window_s}) and hop_s ({hop_s}) must be finite and > 0")
 
+    cal_win_s = (
+        meta_obj.get("calibration_window_s")
+        if meta_obj is not None
+        else getattr(det_obj, "calibration_window_s_", None)
+    )
+    has_bundle = meta_obj is not None or bool(getattr(det_obj, "_loaded_from_bundle_", False))
+    if not allow_window_mismatch:
+        if cal_win_s is not None:
+            if not math.isfinite(float(cal_win_s)) or abs(float(cal_win_s) - float(window_s)) > 1e-6:
+                raise ValueError(
+                    f"Detector calibration_window_s={cal_win_s}s does not match monitor_stream "
+                    f"window_s={window_s}s; recalibrate with --window-s {window_s} or pass "
+                    "allow_window_mismatch=True"
+                )
+        elif has_bundle:
+            raise ValueError(
+                f"Detector bundle lacks calibration_window_s metadata for monitor_stream(window_s={window_s}s); "
+                f"recalibrate with --window-s {window_s} or pass allow_window_mismatch=True"
+            )
+
     win_samples = max(1, int(round(window_s * SR)))
     hop_samples = max(1, int(round(hop_s * SR)))
-    ring = np.empty(0, dtype=np.float32)
-    emitted = 0
-    consumed_since_emit = 0
 
     def _emit_window(buf: np.ndarray, idx: int) -> AudioEvent:
         mel = log_mel(buf, drop_speech_band=drop_speech_band)
-        score = float(detector.score(mel))
+        score = float(det_obj.score(mel))
         win_note = f"stream_window={idx}" if not notes else f"{notes}; stream_window={idx}"
         ev = AudioEvent(
             protocol_id=protocol_id,
@@ -157,7 +182,7 @@ def monitor_stream(
             instrument_id=instrument_id,
             start_utc=now_utc(),
             duration_s=round(float(len(buf)) / float(SR), 6),
-            detector=getattr(detector, "name", type(detector).__name__.lower()),
+            detector=getattr(det_obj, "name", type(det_obj).__name__.lower()),
             score=score,
             threshold=float(threshold),
             sample_rate_hz=SR,
@@ -177,31 +202,37 @@ def monitor_stream(
                 fh.write(ev.to_json() + "\n")
         return ev
 
-    for chunk in pcm_chunks:
-        arr = np.asarray(chunk, dtype=np.float32)
-        if arr.ndim > 1:
-            arr = arr.mean(axis=1, dtype=np.float32)
-        arr = arr.ravel()
-        if arr.size == 0:
-            continue
-        if not np.isfinite(arr).all():
-            raise ValueError("Streaming PCM chunk contains NaN or Inf")
-        if src_sr != SR:
-            g = math.gcd(SR, src_sr)
-            arr = resample_poly(arr, SR // g, src_sr // g).astype(np.float32)
+    def _stream_iter() -> Iterator[AudioEvent]:
+        ring = np.empty(0, dtype=np.float32)
+        emitted = 0
+        consumed_since_emit = 0
+        for chunk in pcm_chunks:
+            arr = np.asarray(chunk, dtype=np.float32)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=1, dtype=np.float32)
+            arr = arr.ravel()
+            if arr.size == 0:
+                continue
+            if not np.isfinite(arr).all():
+                raise ValueError("Streaming PCM chunk contains NaN or Inf")
+            if src_sr != SR:
+                g = math.gcd(SR, src_sr)
+                arr = resample_poly(arr, SR // g, src_sr // g).astype(np.float32)
 
-        ring = np.concatenate([ring, arr])
-        consumed_since_emit += int(arr.size)
+            ring = np.concatenate([ring, arr])
+            consumed_since_emit += int(arr.size)
 
-        while ring.size >= win_samples:
-            ev = _emit_window(ring[:win_samples], emitted)
-            emitted += 1
-            consumed_since_emit = 0
-            yield ev
-            ring = ring[hop_samples:]
+            while ring.size >= win_samples:
+                ev = _emit_window(ring[:win_samples], emitted)
+                emitted += 1
+                consumed_since_emit = 0
+                yield ev
+                ring = ring[hop_samples:]
 
-    if flush_tail and ring.size > 0 and (emitted == 0 or consumed_since_emit > 0):
-        yield _emit_window(ring, emitted)
+        if flush_tail and ring.size > 0 and (emitted == 0 or consumed_since_emit > 0):
+            yield _emit_window(ring, emitted)
+
+    return _stream_iter()
 
 
 def monitor_steps(
@@ -267,6 +298,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--pooling", choices=list(POOLING_MODES), default="max_window")
     ap.add_argument("--threshold", type=float, default=None, help="Explicit threshold (overrides --quantile)")
     ap.add_argument("--quantile", type=float, default=0.99, help="Validation score quantile for threshold calibration")
+    ap.add_argument(
+        "--window-s",
+        type=float,
+        default=None,
+        help="Optional causal streaming window in seconds for chunk-matched calibration",
+    )
+    ap.add_argument(
+        "--hop-s",
+        type=float,
+        default=1.0,
+        help="Causal streaming hop in seconds when --window-s or --stream is set",
+    )
+    ap.add_argument(
+        "--stream",
+        action="store_true",
+        help="Score --wav files via causal monitor_stream() chunks instead of full-clip monitor_steps()",
+    )
+    ap.add_argument(
+        "--allow-window-mismatch",
+        action="store_true",
+        help="Allow monitor_stream() to score a bundle calibrated with a different window_s",
+    )
     ap.add_argument("--protocol-id", default="calibration-only")
     ap.add_argument("--step", type=int, default=0, help="Starting 0-based protocol step index")
     ap.add_argument("--instrument-id", default="benchtop-01")
@@ -295,33 +348,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             threshold = float(args.threshold) if args.threshold is not None else float(meta["threshold"])
             calib_mode = "explicit" if args.threshold is not None else str(meta.get("calibration_mode", "bundle"))
+            cal_win_s = meta.get("calibration_window_s")
+            cal_hop_s = meta.get("calibration_hop_s")
         else:
             train_wavs = _collect_wavs(args.train_dir, args.train_wavs, "training")
-            train_mels = [
-                log_mel(
-                    load_wav_info(w, resample=args.resample, min_source_sr=min_src_sr)[0],
-                    drop_speech_band=drop_speech,
-                )
+            train_wavs_arr = [
+                load_wav_info(w, resample=args.resample, min_source_sr=min_src_sr)[0]
                 for w in train_wavs
             ]
+            train_mels = [log_mel(x, drop_speech_band=drop_speech) for x in train_wavs_arr]
             det = DETECTORS[args.detector](pooling=args.pooling)
             det.fit(train_mels)
 
+            eff_stream_win_s = args.window_s if args.window_s is not None else (2.0 if args.stream else None)
             if args.threshold is not None:
                 threshold = float(args.threshold)
                 calib_mode = "explicit"
+                cal_win_s = (
+                    float(eff_stream_win_s)
+                    if eff_stream_win_s is not None
+                    else round(float(np.median([len(x) / float(SR) for x in train_wavs_arr])), 6)
+                )
+                cal_hop_s = float(args.hop_s) if eff_stream_win_s is not None else None
+                det.calibration_window_s_ = cal_win_s
+                det.calibration_hop_s_ = cal_hop_s
+            elif eff_stream_win_s is not None:
+                if args.val_dir is not None or args.val_wavs:
+                    val_wavs = _collect_wavs(args.val_dir, args.val_wavs, "validation")
+                    val_wavs_arr = [
+                        load_wav_info(w, resample=args.resample, min_source_sr=min_src_sr)[0]
+                        for w in val_wavs
+                    ]
+                    threshold, calib_mode = calibrate_streaming_with_mode(
+                        det,
+                        window_s=eff_stream_win_s,
+                        hop_s=args.hop_s,
+                        quantile=args.quantile,
+                        drop_speech_band=drop_speech,
+                        val_wavs=val_wavs_arr,
+                    )
+                else:
+                    threshold, calib_mode = calibrate_streaming_with_mode(
+                        det,
+                        window_s=eff_stream_win_s,
+                        hop_s=args.hop_s,
+                        quantile=args.quantile,
+                        drop_speech_band=drop_speech,
+                        train_mels=train_mels,
+                        train_wavs=train_wavs_arr,
+                    )
+                cal_win_s = float(eff_stream_win_s)
+                cal_hop_s = float(args.hop_s)
             elif args.val_dir is not None or args.val_wavs:
                 val_wavs = _collect_wavs(args.val_dir, args.val_wavs, "validation")
-                val_mels = [
-                    log_mel(
-                        load_wav_info(w, resample=args.resample, min_source_sr=min_src_sr)[0],
-                        drop_speech_band=drop_speech,
-                    )
+                val_wavs_arr = [
+                    load_wav_info(w, resample=args.resample, min_source_sr=min_src_sr)[0]
                     for w in val_wavs
                 ]
+                val_mels = [log_mel(x, drop_speech_band=drop_speech) for x in val_wavs_arr]
                 threshold, calib_mode = calibrate_with_mode(det, val_mels, quantile=args.quantile, force_oof=False)
+                cal_win_s = round(float(np.median([len(x) / float(SR) for x in val_wavs_arr])), 6)
+                cal_hop_s = None
+                det.calibration_window_s_ = cal_win_s
+                det.calibration_hop_s_ = None
             else:
                 threshold, calib_mode = calibrate_with_mode(det, train_mels, quantile=args.quantile, force_oof=True)
+                cal_win_s = round(float(np.median([len(x) / float(SR) for x in train_wavs_arr])), 6)
+                cal_hop_s = None
+                det.calibration_window_s_ = cal_win_s
+                det.calibration_hop_s_ = None
 
         if args.save_model is not None:
             save_detector_bundle(
@@ -330,26 +425,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 threshold=threshold,
                 calibration_mode=calib_mode,
                 quantile=args.quantile,
+                calibration_window_s=cal_win_s,
+                calibration_hop_s=cal_hop_s,
             )
 
         events: List[AudioEvent] = []
         if args.wav:
             step_wavs = _collect_wavs(None, args.wav, "step")
-            events = monitor_steps(
-                step_wavs,
-                det,
-                threshold=threshold,
-                protocol_id=args.protocol_id,
-                start_step=args.step,
-                instrument_id=args.instrument_id,
-                mic=args.mic,
-                drop_speech_band=drop_speech,
-                resample=args.resample,
-                allow_upsample=args.allow_upsample,
-                save_features_dir=args.save_features_dir,
-                out_jsonl=args.out_jsonl,
-                notes=args.notes,
-            )
+            if args.stream:
+                stream_win_s = float(args.window_s) if args.window_s is not None else 2.0
+                for offset, wp in enumerate(step_wavs):
+                    x_step, src_sr_step = load_wav_info(
+                        wp,
+                        target_sr=SR,
+                        resample=args.resample,
+                        min_source_sr=min_src_sr,
+                    )
+                    events.extend(
+                        monitor_stream(
+                            [x_step],
+                            det,
+                            threshold=threshold,
+                            protocol_id=args.protocol_id,
+                            step=args.step + offset,
+                            instrument_id=args.instrument_id,
+                            sample_rate_hz=SR if args.resample else src_sr_step,
+                            window_s=stream_win_s,
+                            hop_s=args.hop_s,
+                            mic=args.mic,
+                            drop_speech_band=drop_speech,
+                            allow_upsample=args.allow_upsample,
+                            allow_window_mismatch=args.allow_window_mismatch,
+                            out_jsonl=args.out_jsonl,
+                            notes=args.notes,
+                        )
+                    )
+            else:
+                events = monitor_steps(
+                    step_wavs,
+                    det,
+                    threshold=threshold,
+                    protocol_id=args.protocol_id,
+                    start_step=args.step,
+                    instrument_id=args.instrument_id,
+                    mic=args.mic,
+                    drop_speech_band=drop_speech,
+                    resample=args.resample,
+                    allow_upsample=args.allow_upsample,
+                    save_features_dir=args.save_features_dir,
+                    out_jsonl=args.out_jsonl,
+                    notes=args.notes,
+                )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

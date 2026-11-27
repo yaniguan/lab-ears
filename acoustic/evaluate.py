@@ -9,8 +9,10 @@ scored and compared with their file-name labels. Metrics follow the DCASE 2023
 Task 2 rules: AUC per domain (source, target) and pAUC (max FPR 0.1) over both.
 Latency is measured on one CPU thread for one 10 s clip: read, log-mel, score.
 When `--streaming-window-s` is enabled, causal sub-window chunk latency, median
-detection delay on detected anomalies, and false-alarms per hour on normal test
-streams are also evaluated using out-of-fold conformal threshold calibration.
+time-to-first-flag on detected anomalies, measured normal-chunk false-positive rate
+next to `1 - quantile`, and false-alarms per hour on normal test streams are
+evaluated using window-matched clip-grouped out-of-fold conformal calibration across
+all normal training clips.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import platform
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Sequence
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -33,8 +35,8 @@ from scipy.stats import hmean  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
 from threadpoolctl import threadpool_limits  # noqa: E402
 
-from .detect import DETECTORS, POOLING_MODES, calibrate_with_mode, featurize  # noqa: E402
-from .features import SR, load_wav, log_mel  # noqa: E402
+from .detect import DETECTORS, POOLING_MODES, calibrate_streaming_with_mode  # noqa: E402
+from .features import SR, load_wav, log_mel, slice_wav_chunks  # noqa: E402
 
 
 def _require_binary_labels(y_sub: np.ndarray, split_name: str) -> None:
@@ -101,8 +103,10 @@ def _validate_machine_dirs(data: Path, machine: str):
 
 def _evaluate_streaming_chunks(
     det,
-    tr_mel,
-    test_paths,
+    tr_mel: Sequence[np.ndarray],
+    tr_chunk_mels: Sequence[Sequence[np.ndarray]],
+    test_paths: Sequence[Path],
+    test_wavs: Sequence[np.ndarray],
     drop_speech_band: bool,
     window_s: float,
     hop_s: float,
@@ -110,19 +114,27 @@ def _evaluate_streaming_chunks(
 ) -> dict:
     if window_s <= 0.0 or hop_s <= 0.0:
         raise ValueError("streaming_window_s and streaming_hop_s must be > 0")
-    cal_subset = tr_mel[: min(len(tr_mel), 40)]
-    thr, _ = calibrate_with_mode(det, cal_subset, quantile=quantile, force_oof=True)
+    thr, cal_mode = calibrate_streaming_with_mode(
+        det,
+        window_s=window_s,
+        hop_s=hop_s,
+        quantile=quantile,
+        drop_speech_band=drop_speech_band,
+        train_mels=tr_mel,
+        train_chunk_mels=tr_chunk_mels,
+        sr=SR,
+    )
 
     win_n = max(1, int(round(window_s * SR)))
     hop_n = max(1, int(round(hop_s * SR)))
     chunk_lats = []
-    delays_s = []
+    first_flags_s = []
     false_alarm_chunks = 0
+    normal_chunks_total = 0
     normal_duration_s = 0.0
     stream_scores = []
 
-    for p in test_paths:
-        wav = load_wav(p)
+    for p, wav in zip(test_paths, test_wavs):
         is_anom = "_anomaly_" in p.name
         if wav.size <= win_n:
             starts = [0]
@@ -140,6 +152,8 @@ def _evaluate_streaming_chunks(
             chunk_lats.append(1000.0 * (time.perf_counter() - t0))
             clip_chunk_scores.append(sc)
             end_time_s = float(min(wav.size, s_idx + win_n)) / float(SR)
+            if not is_anom:
+                normal_chunks_total += 1
             if sc > thr:
                 if is_anom and first_flag_s is None:
                     first_flag_s = end_time_s
@@ -147,7 +161,7 @@ def _evaluate_streaming_chunks(
                     false_alarm_chunks += 1
 
         if is_anom and first_flag_s is not None:
-            delays_s.append(first_flag_s)
+            first_flags_s.append(first_flag_s)
         if not is_anom:
             normal_duration_s += float(wav.size) / float(SR)
         stream_scores.append(float(max(clip_chunk_scores)))
@@ -157,12 +171,24 @@ def _evaluate_streaming_chunks(
         if normal_duration_s > 0.0
         else 0.0
     )
+    normal_chunk_fpr = (
+        round(float(false_alarm_chunks) / float(normal_chunks_total), 4)
+        if normal_chunks_total > 0
+        else 0.0
+    )
     return {
         "streaming_window_s": float(window_s),
         "streaming_hop_s": float(hop_s),
+        "calibration_mode": str(cal_mode),
+        "calibration_quantile": float(quantile),
+        "target_chunk_fpr": round(1.0 - float(quantile), 6),
+        "normal_chunk_fpr": normal_chunk_fpr,
+        "normal_chunks_total": int(normal_chunks_total),
+        "false_alarm_chunks": int(false_alarm_chunks),
+        "streaming_threshold": round(float(thr), 6),
         "chunk_latency_ms_median": round(float(np.median(chunk_lats)), 2),
         "chunk_latency_ms_p95": round(float(np.percentile(chunk_lats, 95)), 2),
-        "detection_delay_s_median": round(float(np.median(delays_s)), 3) if delays_s else None,
+        "time_to_first_flag_s_median": round(float(np.median(first_flags_s)), 3) if first_flags_s else None,
         "false_alarms_per_hour": fa_per_hour,
         "streaming_scores": stream_scores,
     }
@@ -178,15 +204,26 @@ def run(
     pooling: str = "mean",
     streaming_window_s: Optional[float] = None,
     streaming_hop_s: float = 1.0,
+    quantile: float = 0.99,
 ):
     rows = []
     with threadpool_limits(limits=1):
         for m in machines:
             train, test = _validate_machine_dirs(data, m)
             t0 = time.perf_counter()
-            tr_mel = featurize(train, drop_speech_band)
-            te_mel = featurize(test, drop_speech_band)
+            tr_wavs = [load_wav(p) for p in train]
+            te_wavs = [load_wav(p) for p in test]
+            tr_mel = [log_mel(w, drop_speech_band) for w in tr_wavs]
+            te_mel = [log_mel(w, drop_speech_band) for w in te_wavs]
             feat_s = time.perf_counter() - t0
+            tr_chunk_mels: Optional[List[List[np.ndarray]]] = None
+            if streaming_window_s is not None:
+                if streaming_window_s <= 0.0 or streaming_hop_s <= 0.0:
+                    raise ValueError("streaming_window_s and streaming_hop_s must be > 0")
+                tr_chunk_mels = [
+                    [log_mel(ch, drop_speech_band) for ch in slice_wav_chunks(w, streaming_window_s, streaming_hop_s, sr=SR)]
+                    for w in tr_wavs
+                ]
             for name in detectors:
                 det = DETECTORS[name](pooling=pooling)
                 t0 = time.perf_counter()
@@ -212,17 +249,23 @@ def run(
                     latency_ms_p95=round(float(np.percentile(lat, 95)), 1),
                 )
                 if streaming_window_s is not None:
+                    assert tr_chunk_mels is not None
                     s_info = _evaluate_streaming_chunks(
                         det,
                         tr_mel,
+                        tr_chunk_mels,
                         test,
+                        te_wavs,
                         drop_speech_band=drop_speech_band,
                         window_s=streaming_window_s,
                         hop_s=streaming_hop_s,
+                        quantile=quantile,
                     )
                     s_metrics = metrics([p.name for p in test], s_info.pop("streaming_scores"))
                     r.update(
                         s_info,
+                        streaming_auc_source=round(float(s_metrics["auc_source"]), 4),
+                        streaming_auc_target=round(float(s_metrics["auc_target"]), 4),
                         streaming_pauc=round(float(s_metrics["pauc"]), 4),
                     )
                 rows.append(r)
@@ -248,6 +291,12 @@ def main(argv=None) -> int:
     ap.add_argument("--pooling", choices=list(POOLING_MODES), default="mean")
     ap.add_argument("--streaming-window-s", type=float, default=None, help="Optional causal streaming window in seconds")
     ap.add_argument("--streaming-hop-s", type=float, default=1.0, help="Causal streaming hop in seconds")
+    ap.add_argument("--quantile", type=float, default=0.99, help="Conformal quantile for streaming threshold calibration")
+    ap.add_argument(
+        "--update-existing",
+        action="store_true",
+        help="Merge/update matching (machine, detector, drop_speech_band) rows in --out if it already exists",
+    )
     ap.add_argument("--out", type=Path, default=Path("results/dcase2023_cpu.json"))
     args = ap.parse_args(argv)
     modes = {"keep": [False], "drop": [True], "both": [False, True]}[args.speech_band]
@@ -262,18 +311,32 @@ def main(argv=None) -> int:
                 pooling=args.pooling,
                 streaming_window_s=args.streaming_window_s,
                 streaming_hop_s=args.streaming_hop_s,
+                quantile=args.quantile,
             )
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    final_rows = rows
+    if args.update_existing and args.out.is_file():
+        existing = json.loads(args.out.read_text(encoding="utf-8"))
+        by_key = {(r["machine"], r["detector"], r["drop_speech_band"]): dict(r) for r in existing.get("rows", [])}
+        for r in rows:
+            k = (r["machine"], r["detector"], r["drop_speech_band"])
+            if k in by_key:
+                by_key[k].update(r)
+            else:
+                by_key[k] = dict(r)
+        final_rows = list(by_key.values())
+
     res = {
         "dataset": "DCASE 2023 Task 2 dev (Zenodo 7882613, CC BY 4.0)",
         "cpu": platform.processor() or platform.machine(),
         "threads": 1,
         "pooling": args.pooling,
         "speech_band_filter_mode": "full_hann_skirt_plus_pre_stft_notch",
-        "rows": rows,
-        "summary": summary(rows),
+        "rows": final_rows,
+        "summary": summary(final_rows),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")

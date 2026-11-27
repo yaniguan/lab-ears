@@ -510,9 +510,23 @@ def test_issue33_non_pickle_bundle_upsample_guard_and_streaming(tmp_path: Path):
     assert ev_32k.sample_rate_hz == 16000
     assert ev_32k.source_sample_rate_hz == 32000
 
-    # Causal PCM ring-buffer streaming monitor + evaluate.py streaming metrics
+    # Causal PCM ring-buffer streaming monitor rejects mismatched calibration_window_s (0.6s vs 1.0s)
+    # unless allow_window_mismatch=True is passed (#36)
     long_stream = np.concatenate([_clip(rng, knock=False, seconds=1.5), _clip(rng, knock=True, seconds=1.5)])
     chunks = np.array_split(long_stream, 12)
+    with pytest.raises(ValueError, match="calibration_window_s"):
+        list(
+            monitor_stream(
+                chunks,
+                g_det,
+                threshold=g_meta["threshold"],
+                protocol_id="stream-proto",
+                step=5,
+                instrument_id="valve-01",
+                window_s=1.0,
+                hop_s=0.5,
+            )
+        )
     stream_events = list(
         monitor_stream(
             chunks,
@@ -523,6 +537,7 @@ def test_issue33_non_pickle_bundle_upsample_guard_and_streaming(tmp_path: Path):
             instrument_id="valve-01",
             window_s=1.0,
             hop_s=0.5,
+            allow_window_mismatch=True,
         )
     )
     assert len(stream_events) >= 4
@@ -555,4 +570,161 @@ def test_issue33_non_pickle_bundle_upsample_guard_and_streaming(tmp_path: Path):
     assert s_rows[0]["streaming_window_s"] == pytest.approx(0.5)
     assert s_rows[0]["chunk_latency_ms_median"] >= 0.0
     assert s_rows[0]["false_alarms_per_hour"] >= 0.0
+    assert "time_to_first_flag_s_median" in s_rows[0]
+    assert "detection_delay_s_median" not in s_rows[0]
+    assert "normal_chunk_fpr" in s_rows[0] and "target_chunk_fpr" in s_rows[0]
+
+
+# --- Issue #36: Window-matched 2 s streaming calibration, bundle window guard & chunk FPR ---
+def test_issue36_window_matched_2s_streaming_calibration_and_bundle_guard(tmp_path: Path):
+    from acoustic.detect import calibrate_streaming_with_mode
+    from acoustic.features import slice_wav_chunks
+
+    rng = np.random.default_rng(36)
+    quantile = 0.98
+    target_fpr = 1.0 - quantile  # 0.02 -> 3x ceiling = 0.06
+
+    # Train on 60 normal 6 s clips (5 chunks of 2 s at 1 s hop = 300 OOF normal chunks)
+    train_wavs = [_clip(rng, knock=False, seconds=6.0) for _ in range(60)]
+    train_mels = [log_mel(w, drop_speech_band=True) for w in train_wavs]
+    train_chunk_mels = [
+        [log_mel(ch, drop_speech_band=True) for ch in slice_wav_chunks(w, 2.0, 1.0, sr=SR)]
+        for w in train_wavs
+    ]
+
+    # Fresh held-out normal 6 s streams (40 clips * 5 chunks = 200 fresh normal 2 s chunks)
+    fresh_norm_wavs = [_clip(rng, knock=False, seconds=6.0) for _ in range(40)]
+    fresh_knock_wav = _clip(rng, knock=True, seconds=6.0)
+
+    for det in (
+        GaussianDetector(pooling="mean").fit(train_mels),
+        KNNDetector(k=5, pooling="mean").fit(train_mels),
+    ):
+        thr, mode = calibrate_streaming_with_mode(
+            det,
+            window_s=2.0,
+            hop_s=1.0,
+            quantile=quantile,
+            drop_speech_band=True,
+            train_mels=train_mels,
+            train_chunk_mels=train_chunk_mels,
+        )
+        assert mode == "oof_chunk_conformal"
+        assert det.calibration_window_s_ == pytest.approx(2.0)
+        assert det.calibration_hop_s_ == pytest.approx(1.0)
+
+        bundle_path = tmp_path / f"{det.name}_stream2s.npz"
+        save_detector_bundle(bundle_path, det, threshold=thr, calibration_mode=mode, quantile=quantile)
+        loaded_det, meta = load_detector_bundle(bundle_path)
+        assert meta["calibration_window_s"] == pytest.approx(2.0)
+        assert meta["calibration_hop_s"] == pytest.approx(1.0)
+
+        # Reject mismatched window_s (1.0 s != 2.0 s) unless allow_window_mismatch=True
+        with pytest.raises(ValueError, match="calibration_window_s"):
+            monitor_stream(
+                [fresh_norm_wavs[0]],
+                loaded_det,
+                threshold=meta["threshold"],
+                protocol_id="p36",
+                step=0,
+                instrument_id="valve-01",
+                window_s=1.0,
+                hop_s=0.5,
+            )
+
+        # Score all 200 fresh normal 2 s chunks via monitor_stream(window_s=2.0, hop_s=1.0)
+        norm_events = []
+        for w in fresh_norm_wavs:
+            norm_events.extend(
+                monitor_stream(
+                    [w],
+                    loaded_det,
+                    threshold=meta["threshold"],
+                    protocol_id="p36",
+                    step=0,
+                    instrument_id="valve-01",
+                    window_s=2.0,
+                    hop_s=1.0,
+                    flush_tail=False,
+                )
+            )
+        assert len(norm_events) == 200
+        chunk_fpr = float(np.mean([ev.flagged for ev in norm_events]))
+        assert chunk_fpr <= 3.0 * target_fpr, f"{det.name} chunk_fpr={chunk_fpr:.4f} exceeded 3*(1-q)={3*target_fpr:.4f}"
+
+        # Anomalous knock stream must still flag promptly
+        knock_events = list(
+            monitor_stream(
+                [fresh_knock_wav],
+                loaded_det,
+                threshold=meta["threshold"],
+                protocol_id="p36",
+                step=1,
+                instrument_id="valve-01",
+                window_s=2.0,
+                hop_s=1.0,
+                flush_tail=False,
+            )
+        )
+        assert any(ev.flagged for ev in knock_events)
+
+    # CLI --window-s / --stream integration check
+    norm_dir = tmp_path / "cli_norm"
+    norm_dir.mkdir()
+    for i in range(6):
+        wavfile.write(norm_dir / f"n_{i}.wav", SR, train_wavs[i])
+    knock_path = tmp_path / "cli_knock.wav"
+    wavfile.write(knock_path, SR, fresh_knock_wav)
+    cli_bundle = tmp_path / "cli_stream_bundle.npz"
+    assert (
+        monitor_main(
+            [
+                "--train-dir",
+                str(norm_dir),
+                "--detector",
+                "gaussian",
+                "--window-s",
+                "2.0",
+                "--hop-s",
+                "1.0",
+                "--save-model",
+                str(cli_bundle),
+            ]
+        )
+        == 0
+    )
+    _, cli_meta = load_detector_bundle(cli_bundle)
+    assert cli_meta["calibration_window_s"] == pytest.approx(2.0)
+    assert cli_meta["calibration_hop_s"] == pytest.approx(1.0)
+    # Scoring with mismatched --window-s 1.0 via --stream fails closed (exit code 1)
+    assert (
+        monitor_main(
+            [
+                "--load-model",
+                str(cli_bundle),
+                "--wav",
+                str(knock_path),
+                "--stream",
+                "--window-s",
+                "1.0",
+            ]
+        )
+        == 1
+    )
+    # Matching --window-s 2.0 succeeds
+    assert (
+        monitor_main(
+            [
+                "--load-model",
+                str(cli_bundle),
+                "--wav",
+                str(knock_path),
+                "--stream",
+                "--window-s",
+                "2.0",
+            ]
+        )
+        == 0
+    )
+
 

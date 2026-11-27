@@ -6,7 +6,7 @@ import json
 import math
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.stats import t as student_t
@@ -14,7 +14,16 @@ from sklearn.covariance import LedoitWolf
 from sklearn.neighbors import NearestNeighbors
 from sklearn.neural_network import MLPRegressor
 
-from .features import N_MELS, SR, clip_vector, log_mel, mel_windows, speech_band_mask, stack_frames
+from .features import (
+    N_MELS,
+    SR,
+    clip_vector,
+    log_mel,
+    mel_windows,
+    slice_wav_chunks,
+    speech_band_mask,
+    stack_frames,
+)
 
 BUNDLE_SCHEMA = "lab-ears/detector-bundle/v1"
 POOLING_MODES = ("mean", "p95", "max_window")
@@ -138,6 +147,9 @@ class GaussianDetector:
         self.speech_band_dropped_: Optional[bool] = None
         self.location_: Optional[np.ndarray] = None
         self.precision_: Optional[np.ndarray] = None
+        self.calibration_window_s_: Optional[float] = None
+        self.calibration_hop_s_: Optional[float] = None
+        self._loaded_from_bundle_: bool = False
         self._train_fingerprints_: set = set()
 
     def _clone_unfit(self) -> "GaussianDetector":
@@ -205,6 +217,9 @@ class KNNDetector:
         self.n_mels_: Optional[int] = None
         self.speech_band_dropped_: Optional[bool] = None
         self.train_Xs_: Optional[np.ndarray] = None
+        self.calibration_window_s_: Optional[float] = None
+        self.calibration_hop_s_: Optional[float] = None
+        self._loaded_from_bundle_: bool = False
         self._train_fingerprints_: set = set()
 
     def _clone_unfit(self) -> "KNNDetector":
@@ -282,6 +297,9 @@ class AutoencoderDetector:
         self.speech_band_dropped_: Optional[bool] = None
         self.coefs_: Optional[List[np.ndarray]] = None
         self.intercepts_: Optional[List[np.ndarray]] = None
+        self.calibration_window_s_: Optional[float] = None
+        self.calibration_hop_s_: Optional[float] = None
+        self._loaded_from_bundle_: bool = False
         self._train_fingerprints_: set = set()
 
     def _clone_unfit(self) -> "AutoencoderDetector":
@@ -464,6 +482,158 @@ def calibrate_threshold(detector, val_mels: Iterable[np.ndarray], quantile: floa
     return thr
 
 
+def compute_oof_chunk_scores(
+    detector,
+    normal_mels: Sequence[np.ndarray],
+    normal_chunk_mels: Sequence[Sequence[np.ndarray]],
+) -> np.ndarray:
+    """Compute clip-grouped K-fold out-of-fold anomaly scores on sub-clip streaming chunks.
+
+    Each fold holds out entire normal clips from `normal_mels` before fitting a clone of
+    `detector`, then scores all streaming chunks `normal_chunk_mels[idx]` belonging to those
+    held-out clips so neither full-clip statistics nor intra-clip sibling chunks leak.
+    """
+    mel_list = [np.asarray(m, dtype=np.float32) for m in normal_mels]
+    n = len(mel_list)
+    if n == 0:
+        raise ValueError("normal_mels must contain at least 1 clip")
+    if len(normal_chunk_mels) != n:
+        raise ValueError(
+            f"Length mismatch: {n} normal_mels vs {len(normal_chunk_mels)} normal_chunk_mels"
+        )
+    chunk_lists = [[np.asarray(cm, dtype=np.float32) for cm in cms] for cms in normal_chunk_mels]
+    if any(len(cms) == 0 for cms in chunk_lists):
+        raise ValueError("Every normal clip must yield at least 1 streaming chunk")
+
+    if n == 1:
+        if isinstance(detector, GaussianDetector):
+            raise ValueError("GaussianDetector requires at least 2 clips for OOF chunk calibration")
+        return np.asarray([float(detector.score(cm)) for cm in chunk_lists[0]], dtype=np.float64)
+
+    if isinstance(detector, GaussianDetector) and n == 2:
+        v0 = clip_vector(mel_list[0], pooling="mean").astype(np.float64)
+        v1 = clip_vector(mel_list[1], pooling="mean").astype(np.float64)
+        out_scores: List[float] = []
+        for cm in chunk_lists[0]:
+            vc = clip_vector(cm, pooling="mean").astype(np.float64)
+            d = float(np.linalg.norm(vc - v1))
+            out_scores.append(d * d if detector.squared else d)
+        for cm in chunk_lists[1]:
+            vc = clip_vector(cm, pooling="mean").astype(np.float64)
+            d = float(np.linalg.norm(vc - v0))
+            out_scores.append(d * d if detector.squared else d)
+        return np.asarray(out_scores, dtype=np.float64)
+
+    max_folds = 5 if isinstance(detector, AutoencoderDetector) else min(n, 20)
+    if isinstance(detector, GaussianDetector):
+        max_folds = min(max_folds, n)
+
+    folds = [f for f in np.array_split(np.arange(n), max_folds) if len(f) > 0]
+    chunk_scores: List[float] = []
+    for fold in folds:
+        mask = np.ones(n, dtype=bool)
+        mask[fold] = False
+        tr_fold = [mel_list[i] for i in np.where(mask)[0]]
+        sub_det = detector._clone_unfit()
+        if isinstance(sub_det, KNNDetector):
+            sub_det.fit(tr_fold, _warn_clamp=False)
+        else:
+            sub_det.fit(tr_fold)
+        for idx in fold:
+            for cm in chunk_lists[int(idx)]:
+                chunk_scores.append(float(sub_det.score(cm)))
+    return np.asarray(chunk_scores, dtype=np.float64)
+
+
+def calibrate_streaming_with_mode(
+    detector,
+    *,
+    window_s: float,
+    hop_s: float = 1.0,
+    quantile: float = 0.99,
+    drop_speech_band: bool = True,
+    val_wavs: Optional[Sequence[np.ndarray]] = None,
+    train_mels: Optional[Sequence[np.ndarray]] = None,
+    train_wavs: Optional[Sequence[np.ndarray]] = None,
+    train_chunk_mels: Optional[Sequence[Sequence[np.ndarray]]] = None,
+    sr: int = SR,
+) -> Tuple[float, str]:
+    """Calibrate a streaming threshold on chunks of exact `(window_s, hop_s)` duration.
+
+    Uses held-out validation chunks when `val_wavs` is supplied, or clip-grouped K-fold
+    out-of-fold chunks across ALL normal training clips (`train_mels` + `train_wavs` /
+    `train_chunk_mels`), storing `calibration_window_s_` and `calibration_hop_s_` on `detector`.
+    """
+    if window_s <= 0.0 or hop_s <= 0.0 or not (math.isfinite(window_s) and math.isfinite(hop_s)):
+        raise ValueError(f"window_s ({window_s}) and hop_s ({hop_s}) must be finite and > 0")
+    if not (0.0 < quantile <= 1.0) or not np.isfinite(quantile):
+        raise ValueError(f"quantile must be finite and in (0.0, 1.0], got {quantile}")
+
+    if val_wavs is not None:
+        if len(val_wavs) == 0:
+            raise ValueError("val_wavs must contain at least 1 validation waveform")
+        val_chunks = [
+            log_mel(ch, drop_speech_band=drop_speech_band)
+            for w in val_wavs
+            for ch in slice_wav_chunks(w, window_s, hop_s, sr=sr)
+        ]
+        scores = np.asarray([detector.score(cm) for cm in val_chunks], dtype=np.float64)
+        mode = "heldout_chunk_conformal"
+    else:
+        if train_mels is None:
+            raise ValueError("Provide val_wavs or train_mels + (train_wavs or train_chunk_mels)")
+        if train_chunk_mels is None:
+            if train_wavs is None:
+                raise ValueError("Provide train_wavs or precomputed train_chunk_mels for OOF chunk calibration")
+            train_chunk_mels = [
+                [log_mel(ch, drop_speech_band=drop_speech_band) for ch in slice_wav_chunks(w, window_s, hop_s, sr=sr)]
+                for w in train_wavs
+            ]
+        scores = compute_oof_chunk_scores(detector, train_mels, train_chunk_mels)
+        mode = "oof_chunk_conformal"
+
+    if not np.isfinite(scores).all():
+        raise ValueError("Non-finite anomaly score encountered during streaming chunk calibration")
+
+    thr = _conformal_threshold_from_scores(
+        scores,
+        float(quantile),
+        parametric_small_sample=(scores.size < 25) or (mode == "oof_chunk_conformal"),
+    )
+    detector.calibration_window_s_ = float(window_s)
+    detector.calibration_hop_s_ = float(hop_s)
+    return thr, mode
+
+
+def calibrate_streaming_threshold(
+    detector,
+    *,
+    window_s: float,
+    hop_s: float = 1.0,
+    quantile: float = 0.99,
+    drop_speech_band: bool = True,
+    val_wavs: Optional[Sequence[np.ndarray]] = None,
+    train_mels: Optional[Sequence[np.ndarray]] = None,
+    train_wavs: Optional[Sequence[np.ndarray]] = None,
+    train_chunk_mels: Optional[Sequence[Sequence[np.ndarray]]] = None,
+    sr: int = SR,
+) -> float:
+    """Calibrate a window-matched streaming anomaly threshold at `quantile` in (0, 1]."""
+    thr, _ = calibrate_streaming_with_mode(
+        detector,
+        window_s=window_s,
+        hop_s=hop_s,
+        quantile=quantile,
+        drop_speech_band=drop_speech_band,
+        val_wavs=val_wavs,
+        train_mels=train_mels,
+        train_wavs=train_wavs,
+        train_chunk_mels=train_chunk_mels,
+        sr=sr,
+    )
+    return thr
+
+
 def save_detector_bundle(
     bundle_path: Path | str,
     detector,
@@ -471,12 +641,29 @@ def save_detector_bundle(
     threshold: float,
     calibration_mode: str = "heldout_conformal",
     quantile: float = 0.99,
+    calibration_window_s: Optional[float] = None,
+    calibration_hop_s: Optional[float] = None,
 ) -> Path:
     """Persist fitted detector weights and calibrated threshold via safe non-pickle `.npz` + `.json`."""
     if getattr(detector, "n_mels_", None) is None:
         raise RuntimeError("Detector must be fit() before saving bundle")
     if not math.isfinite(float(threshold)):
         raise ValueError(f"threshold must be finite, got {threshold!r}")
+
+    eff_win_s = (
+        calibration_window_s
+        if calibration_window_s is not None
+        else getattr(detector, "calibration_window_s_", None)
+    )
+    eff_hop_s = (
+        calibration_hop_s
+        if calibration_hop_s is not None
+        else getattr(detector, "calibration_hop_s_", None)
+    )
+    if eff_win_s is not None and (not math.isfinite(float(eff_win_s)) or float(eff_win_s) <= 0.0):
+        raise ValueError(f"calibration_window_s must be finite and > 0, got {eff_win_s!r}")
+    if eff_hop_s is not None and (not math.isfinite(float(eff_hop_s)) or float(eff_hop_s) <= 0.0):
+        raise ValueError(f"calibration_hop_s must be finite and > 0, got {eff_hop_s!r}")
 
     p = Path(bundle_path)
     npz_path = p if p.suffix == ".npz" else p.with_suffix(".npz")
@@ -489,6 +676,8 @@ def save_detector_bundle(
         "threshold": float(threshold),
         "quantile": float(quantile),
         "calibration_mode": str(calibration_mode),
+        "calibration_window_s": float(eff_win_s) if eff_win_s is not None else None,
+        "calibration_hop_s": float(eff_hop_s) if eff_hop_s is not None else None,
         "n_mels": int(detector.n_mels_),
         "drop_speech_band": detector.speech_band_dropped_,
         "pooling": str(detector.pooling),
@@ -602,6 +791,12 @@ def load_detector_bundle(bundle_path: Path | str) -> Tuple[Any, Dict[str, Any]]:
             det.intercepts_ = [np.asarray(archive[f"intercept_{i}"], dtype=np.float64) for i in range(n_layers)]
         else:
             raise ValueError(f"Unknown detector name in bundle: {det_name!r}")
+
+        cal_win = meta.get("calibration_window_s")
+        cal_hop = meta.get("calibration_hop_s")
+        det.calibration_window_s_ = float(cal_win) if cal_win is not None else None
+        det.calibration_hop_s_ = float(cal_hop) if cal_hop is not None else None
+        det._loaded_from_bundle_ = True
 
     return det, meta
 

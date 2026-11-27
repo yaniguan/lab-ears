@@ -30,10 +30,50 @@ if str(REPO_DIR) not in sys.path:
 SPEECH_BAND_LO_HZ = 300.0
 SPEECH_BAND_HI_HZ = 3400.0
 DEFAULT_SAMPLE_RATE_HZ = 16000
-DEFAULT_RETAINED_BANDS_HZ = [[60, 260], [3600, 7800]]
 DEFAULT_VOLUME_UL = 100.0
 DEFAULT_TEMP_C = 25.0
 DEFAULT_DURATION_MIN = 15.0
+
+
+def _compute_default_retained_bands_hz(
+    *,
+    drop_speech_band: bool = True,
+    sr: int = DEFAULT_SAMPLE_RATE_HZ,
+    n_fft: int = 1024,
+    n_mels: int = 64,
+) -> list[list[int]]:
+    """Derive retained mel-band Hz intervals directly from `acoustic.features.retained_mel_bands_hz`."""
+    try:
+        from acoustic.features import retained_mel_bands_hz
+
+        return [list(pair) for pair in retained_mel_bands_hz(drop_speech_band=drop_speech_band, sr=sr, n_fft=n_fft, n_mels=n_mels)]
+    except ImportError:
+        # Pure-stdlib HTK mel fallback when numpy/scipy are not installed
+        fmax = sr / 2.0
+        mel_max = 2595.0 * math.log10(1.0 + fmax / 700.0)
+        hz = [700.0 * (10.0 ** ((mel_max * i / (n_mels + 1)) / 2595.0) - 1.0) for i in range(n_mels + 2)]
+        hz[0] = 0.0
+        hz[-1] = fmax
+        edges = [(hz[i], hz[i + 2]) for i in range(n_mels)]
+        if not drop_speech_band:
+            return [[0, int(math.ceil(fmax))]]
+        skirt = 2.0 * float(sr) / float(n_fft)
+        keep = [(hi + skirt <= SPEECH_BAND_LO_HZ) or (lo - skirt >= SPEECH_BAND_HI_HZ) for lo, hi in edges]
+        bands: list[list[int]] = []
+        idx = 0
+        while idx < len(keep):
+            if not keep[idx]:
+                idx += 1
+                continue
+            end_idx = idx
+            while end_idx + 1 < len(keep) and keep[end_idx + 1]:
+                end_idx += 1
+            bands.append([max(0, int(math.floor(edges[idx][0]))), int(math.ceil(edges[end_idx][1]))])
+            idx = end_idx + 1
+        return bands
+
+
+DEFAULT_RETAINED_BANDS_HZ = _compute_default_retained_bands_hz(drop_speech_band=True)
 
 _PARSE_MODULE_KEY = "_lab_ears_demo_parse_protocol"
 _BARE_LIST_TEMP_RE = re.compile(
@@ -319,63 +359,132 @@ def _coerce_obj_dict(item: Any) -> dict[str, Any] | None:
     return None
 
 
-def _inspect_acoustic_inputs(packet: dict[str, Any]) -> tuple[bool, bool, bool, dict[str, Any]]:
-    """Inspect packet for AudioEvent and InterlockDecision records.
+def _missing_privacy_fields(record: dict[str, Any]) -> list[str]:
+    """Return missing required privacy metadata field names for an attached acoustic record."""
+    missing: list[str] = []
+    if "speech_band_dropped" not in record or record["speech_band_dropped"] is None:
+        missing.append("speech_band_dropped")
+    has_saved = "raw_audio_saved" in record and record["raw_audio_saved"] is not None
+    has_kept = "raw_audio_kept" in record and record["raw_audio_kept"] is not None
+    if not (has_saved or has_kept):
+        missing.append("raw_audio_saved")
+    if "retained_bands_hz" not in record or record["retained_bands_hz"] is None:
+        missing.append("retained_bands_hz")
+    return missing
 
-    Returns `(events_privacy_ok, interlock_halted, anomaly_halted, acoustic_telemetry)`.
+
+def _inspect_acoustic_inputs(
+    packet: dict[str, Any],
+) -> tuple[bool, list[str], bool, bool, bool, dict[str, Any]]:
+    """Inspect packet for AudioEvent and InterlockDecision records (strictly fail-closed).
+
+    Returns `(events_privacy_ok, privacy_reasons, any_event_raw_retained, interlock_halted, anomaly_halted, acoustic_telemetry)`.
     """
-    raw_events: list[dict[str, Any]] = []
-    raw_interlocks: list[dict[str, Any]] = []
+    raw_events: list[tuple[str, dict[str, Any]]] = []
+    raw_interlocks: list[tuple[str, dict[str, Any]]] = []
+    privacy_reasons: list[str] = []
+    events_privacy_ok = True
+    any_event_raw_retained = False
 
     if packet.get("schema") == AUDIO_EVENT_SCHEMA or (
         "score" in packet and "threshold" in packet and "detector" in packet
     ):
-        raw_events.append(dict(packet))
+        raw_events.append(("packet", dict(packet)))
 
     if "audio_event" in packet and packet["audio_event"] is not None:
         coerced = _coerce_obj_dict(packet["audio_event"])
-        if coerced is not None:
-            raw_events.append(coerced)
+        if coerced is None:
+            events_privacy_ok = False
+            privacy_reasons.append(
+                "Malformed audio_event record: missing required privacy fields "
+                "(speech_band_dropped, raw_audio_saved, retained_bands_hz)."
+            )
+        else:
+            raw_events.append(("audio_event", coerced))
 
-    if isinstance(packet.get("audio_events"), (list, tuple)):
-        for item in packet["audio_events"]:
-            coerced = _coerce_obj_dict(item)
-            if coerced is not None:
-                raw_events.append(coerced)
+    if "audio_events" in packet and packet["audio_events"] is not None:
+        if not isinstance(packet["audio_events"], (list, tuple)):
+            events_privacy_ok = False
+            privacy_reasons.append("Malformed audio_events field: expected a list of AudioEvent records.")
+        else:
+            for idx, item in enumerate(packet["audio_events"]):
+                coerced = _coerce_obj_dict(item)
+                if coerced is None:
+                    events_privacy_ok = False
+                    privacy_reasons.append(
+                        f"Malformed audio_events[{idx}] record: missing required privacy fields "
+                        "(speech_band_dropped, raw_audio_saved, retained_bands_hz)."
+                    )
+                else:
+                    raw_events.append((f"audio_events[{idx}]", coerced))
 
     if "halt_run" in packet and ("cavitation_ratio" in packet or "stall_ratio" in packet):
-        raw_interlocks.append(dict(packet))
+        raw_interlocks.append(("packet", dict(packet)))
 
     if "interlock_decision" in packet and packet["interlock_decision"] is not None:
         coerced = _coerce_obj_dict(packet["interlock_decision"])
-        if coerced is not None:
-            raw_interlocks.append(coerced)
+        if coerced is None:
+            events_privacy_ok = False
+            privacy_reasons.append(
+                "Malformed interlock_decision record: missing required privacy fields "
+                "(speech_band_dropped, raw_audio_saved, retained_bands_hz)."
+            )
+        else:
+            raw_interlocks.append(("interlock_decision", coerced))
 
-    if isinstance(packet.get("interlock_decisions"), (list, tuple)):
-        for item in packet["interlock_decisions"]:
-            coerced = _coerce_obj_dict(item)
-            if coerced is not None:
-                raw_interlocks.append(coerced)
+    if "interlock_decisions" in packet and packet["interlock_decisions"] is not None:
+        if not isinstance(packet["interlock_decisions"], (list, tuple)):
+            events_privacy_ok = False
+            privacy_reasons.append(
+                "Malformed interlock_decisions field: expected a list of InterlockDecision records."
+            )
+        else:
+            for idx, item in enumerate(packet["interlock_decisions"]):
+                coerced = _coerce_obj_dict(item)
+                if coerced is None:
+                    events_privacy_ok = False
+                    privacy_reasons.append(
+                        f"Malformed interlock_decisions[{idx}] record: missing required privacy fields "
+                        "(speech_band_dropped, raw_audio_saved, retained_bands_hz)."
+                    )
+                else:
+                    raw_interlocks.append((f"interlock_decisions[{idx}]", coerced))
 
-    events_privacy_ok = True
     interlock_halted = False
     anomaly_halted = False
     normalized_records: list[dict[str, Any]] = []
 
-    for ev in raw_events:
-        ev_raw_saved = ev.get("raw_audio_saved", False)
-        ev_raw_kept = ev.get("raw_audio_kept", False)
-        ev_speech_dropped = ev.get("speech_band_dropped", True)
-        ev_sr = ev.get("sample_rate_hz", DEFAULT_SAMPLE_RATE_HZ)
-        ev_bands = ev.get("retained_bands_hz", DEFAULT_RETAINED_BANDS_HZ)
-        if not verify_speech_privacy(
-            ev_bands,
-            ev_raw_saved,
-            raw_audio_kept=ev_raw_kept,
-            speech_band_dropped=ev_speech_dropped,
-            sample_rate_hz=ev_sr,
-        ):
+    for src_label, ev in raw_events:
+        missing = _missing_privacy_fields(ev)
+        ev_has_saved = "raw_audio_saved" in ev and ev["raw_audio_saved"] is not None
+        ev_has_kept = "raw_audio_kept" in ev and ev["raw_audio_kept"] is not None
+        ev_raw_saved = ev["raw_audio_saved"] if ev_has_saved else (ev["raw_audio_kept"] if ev_has_kept else None)
+        ev_raw_kept = ev["raw_audio_kept"] if ev_has_kept else ev_raw_saved
+        if ev_raw_saved is True or ev_raw_kept is True:
+            any_event_raw_retained = True
+
+        if missing:
             events_privacy_ok = False
+            privacy_reasons.append(
+                f"{src_label} missing required privacy field(s): {', '.join(missing)}"
+            )
+        else:
+            ev_speech_dropped = ev["speech_band_dropped"]
+            ev_sr = ev.get("sample_rate_hz", DEFAULT_SAMPLE_RATE_HZ)
+            ev_bands = ev["retained_bands_hz"]
+            if not verify_speech_privacy(
+                ev_bands,
+                ev_raw_saved,
+                raw_audio_kept=ev_raw_kept,
+                speech_band_dropped=ev_speech_dropped,
+                sample_rate_hz=ev_sr,
+            ):
+                events_privacy_ok = False
+                privacy_reasons.append(
+                    f"{src_label} failed speech-privacy verification "
+                    f"(speech_band_dropped={ev_speech_dropped!r}, raw_audio_saved={ev_raw_saved!r}, "
+                    f"retained_bands_hz={ev_bands!r})"
+                )
 
         score_raw = ev.get("score", 0.0)
         thr_raw = ev.get("threshold", 0.0)
@@ -391,7 +500,10 @@ def _inspect_acoustic_inputs(packet: dict[str, Any]) -> tuple[bool, bool, bool, 
             flagged = bool(ev.get("flagged") is True or score_f > thr_f)
             if flagged:
                 anomaly_halted = True
-            reason = "acoustic_anomaly_exceeded_threshold" if flagged else "nominal"
+            if missing:
+                reason = f"missing_privacy_fields:{','.join(missing)}"
+            else:
+                reason = "acoustic_anomaly_exceeded_threshold" if flagged else "nominal"
 
         normalized_records.append(
             {
@@ -408,20 +520,37 @@ def _inspect_acoustic_inputs(packet: dict[str, Any]) -> tuple[bool, bool, bool, 
             }
         )
 
-    for dec in raw_interlocks:
-        dec_raw_saved = dec.get("raw_audio_saved", False)
-        dec_raw_kept = dec.get("raw_audio_kept", False)
-        dec_speech_dropped = dec.get("speech_band_dropped", True)
-        dec_sr = dec.get("sample_rate_hz", DEFAULT_SAMPLE_RATE_HZ)
-        dec_bands = dec.get("retained_bands_hz", DEFAULT_RETAINED_BANDS_HZ)
-        if not verify_speech_privacy(
-            dec_bands,
-            dec_raw_saved,
-            raw_audio_kept=dec_raw_kept,
-            speech_band_dropped=dec_speech_dropped,
-            sample_rate_hz=dec_sr,
-        ):
+    for src_label, dec in raw_interlocks:
+        missing = _missing_privacy_fields(dec)
+        dec_has_saved = "raw_audio_saved" in dec and dec["raw_audio_saved"] is not None
+        dec_has_kept = "raw_audio_kept" in dec and dec["raw_audio_kept"] is not None
+        dec_raw_saved = dec["raw_audio_saved"] if dec_has_saved else (dec["raw_audio_kept"] if dec_has_kept else None)
+        dec_raw_kept = dec["raw_audio_kept"] if dec_has_kept else dec_raw_saved
+        if dec_raw_saved is True or dec_raw_kept is True:
+            any_event_raw_retained = True
+
+        if missing:
             events_privacy_ok = False
+            privacy_reasons.append(
+                f"{src_label} missing required privacy field(s): {', '.join(missing)}"
+            )
+        else:
+            dec_speech_dropped = dec["speech_band_dropped"]
+            dec_sr = dec.get("sample_rate_hz", DEFAULT_SAMPLE_RATE_HZ)
+            dec_bands = dec["retained_bands_hz"]
+            if not verify_speech_privacy(
+                dec_bands,
+                dec_raw_saved,
+                raw_audio_kept=dec_raw_kept,
+                speech_band_dropped=dec_speech_dropped,
+                sample_rate_hz=dec_sr,
+            ):
+                events_privacy_ok = False
+                privacy_reasons.append(
+                    f"{src_label} failed speech-privacy verification "
+                    f"(speech_band_dropped={dec_speech_dropped!r}, raw_audio_saved={dec_raw_saved!r}, "
+                    f"retained_bands_hz={dec_bands!r})"
+                )
 
         cav_raw = dec.get("cavitation_ratio", 0.0)
         stall_raw = dec.get("stall_ratio", 0.0)
@@ -440,7 +569,10 @@ def _inspect_acoustic_inputs(packet: dict[str, Any]) -> tuple[bool, bool, bool, 
             halt_flag = bool(dec.get("halt_run", False))
             if halt_flag:
                 interlock_halted = True
-            reason = str(dec.get("reason", "interlock_halt" if halt_flag else "nominal"))
+            if missing:
+                reason = f"missing_privacy_fields:{','.join(missing)}"
+            else:
+                reason = str(dec.get("reason", "interlock_halt" if halt_flag else "nominal"))
 
         normalized_records.append(
             {
@@ -459,6 +591,11 @@ def _inspect_acoustic_inputs(packet: dict[str, Any]) -> tuple[bool, bool, bool, 
 
     flagged_records = [r for r in normalized_records if r["flagged"]]
     primary = flagged_records[0] if flagged_records else (normalized_records[0] if normalized_records else None)
+    default_fault_reason = (
+        privacy_reasons[0]
+        if (not events_privacy_ok and privacy_reasons)
+        else (primary["fault_reason"] if primary is not None else "nominal")
+    )
 
     telemetry: dict[str, Any] = {
         "step": primary["step"] if primary is not None else None,
@@ -468,12 +605,12 @@ def _inspect_acoustic_inputs(packet: dict[str, Any]) -> tuple[bool, bool, bool, 
         "threshold": primary["threshold"] if primary is not None else None,
         "cavitation_ratio": primary["cavitation_ratio"] if primary is not None else 0.0,
         "stall_ratio": primary["stall_ratio"] if primary is not None else 0.0,
-        "fault_reason": primary["fault_reason"] if primary is not None else "nominal",
+        "fault_reason": default_fault_reason,
         "flagged": bool(flagged_records),
         "flagged_steps": [r["step"] for r in flagged_records],
         "events": normalized_records,
     }
-    return events_privacy_ok, interlock_halted, anomaly_halted, telemetry
+    return events_privacy_ok, privacy_reasons, any_event_raw_retained, interlock_halted, anomaly_halted, telemetry
 
 
 def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
@@ -531,7 +668,14 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
     else:
         duration_min = dur_sel
 
-    events_privacy_ok, interlock_halted, anomaly_halted, telemetry = _inspect_acoustic_inputs(incoming)
+    (
+        events_privacy_ok,
+        privacy_reasons,
+        any_event_raw_retained,
+        interlock_halted,
+        anomaly_halted,
+        telemetry,
+    ) = _inspect_acoustic_inputs(incoming)
 
     top_privacy_ok = verify_speech_privacy(
         retained_bands_hz,
@@ -541,13 +685,23 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
         sample_rate_hz=sample_rate_hz,
         window_skirt_hz=window_skirt_hz,
     )
+    if not top_privacy_ok:
+        privacy_reasons.insert(
+            0,
+            "Top-level packet failed speech-privacy verification: retained bands overlap "
+            "(300, 3400) Hz, exceed Nyquist, or raw audio was retained.",
+        )
     privacy_ok = bool(top_privacy_ok and events_privacy_ok)
 
     # Unify raw_audio_saved and raw_audio_kept on the outgoing packet
-    any_raw_retained = bool(raw_audio_saved_in is not False or raw_audio_kept_in is not False)
+    any_raw_retained = bool(
+        raw_audio_saved_in is not False or raw_audio_kept_in is not False or any_event_raw_retained
+    )
     out["raw_audio_saved"] = any_raw_retained
     out["raw_audio_kept"] = any_raw_retained
 
+    defaults_only = len(spans_list) == 0
+    out["defaults_only"] = defaults_only
     out["parsed_spans"] = {
         "spans": spans_list,
         "steps": steps_list,
@@ -563,6 +717,7 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "duration_min": duration_min,
         "duration_min_range": dur_range,
         "defaults_applied": defaults_applied,
+        "defaults_only": defaults_only,
         "multi_step_ambiguous": bool(vol_amb or temp_amb or dur_amb),
     }
     out["acoustic_telemetry"] = telemetry
@@ -572,10 +727,10 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
         out["halt_reason"] = "L2_SPEECH_PRIVACY_BLOCK"
         out["speech_band_dropped"] = False
         status = "BLOCK"
-        summary = (
-            "Speech-band privacy check failed: retained bands overlap (300, 3400) Hz, "
-            "exceed Nyquist, or raw audio was retained."
+        detail = "; ".join(privacy_reasons) if privacy_reasons else (
+            "retained bands overlap (300, 3400) Hz, exceed Nyquist, or raw audio was retained."
         )
+        summary = f"Speech-band privacy check failed: {detail}"
     elif interlock_halted:
         out["halted"] = True
         out["halt_reason"] = "L2_CAVITATION_INTERLOCK_HALT"
@@ -594,6 +749,17 @@ def process_packet(packet: dict[str, Any]) -> dict[str, Any]:
         summary = (
             f"Calibrated acoustic monitor halted at step {telemetry['step']} on "
             f"{telemetry['instrument_id']} (score={telemetry['score']} > threshold={telemetry['threshold']})."
+        )
+    elif defaults_applied:
+        out["halted"] = False
+        out["halt_reason"] = None
+        out["speech_band_dropped"] = True
+        status = "WARN"
+        summary = (
+            f"Extracted {len(spans_list)} span(s) across {len(steps_list)} step(s) "
+            f"(volume_ul={volume_ul}, temp_c={temp_c}, duration_min={duration_min}; "
+            f"defaults_applied={defaults_applied}, defaults_only={defaults_only}); "
+            "speech band (300, 3400) Hz dropped."
         )
     else:
         out["halted"] = False

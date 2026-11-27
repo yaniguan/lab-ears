@@ -13,9 +13,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt pytest>=8
-      - name: Run offline protocol parser unit tests
-        run: python -m pytest -q tests/test_parse_protocol.py
+      - run: pip install -r requirements.txt "pytest>=8"
+      - name: Run stdlib-only protocol parser and learned tagger unit tests
+        run: python -m pytest -p no:cacheprovider -q tests/test_parse_protocol.py tests/test_learned_tagger.py
       - name: Cache pinned WLP-Dataset
         id: cache-wlp
         uses: actions/cache@v4
@@ -29,10 +29,13 @@ jobs:
           git -C data/WLP-Dataset remote add origin https://github.com/chaitanya2334/WLP-Dataset
           git -C data/WLP-Dataset fetch --depth 1 origin "$WLP_COMMIT"
           git -C data/WLP-Dataset checkout FETCH_HEAD
-      - name: Verify pinned SHA and run WLP benchmark with F1 gate
+      - name: Verify pinned SHA, run WLP F1 gate, and diff against demo/output.txt
         run: |
           test "$(git -C data/WLP-Dataset rev-parse HEAD)" = "$WLP_COMMIT"
-          python demo/parse_protocol.py data/WLP-Dataset/test --min-f1 0.78
+          python demo/parse_protocol.py data/WLP-Dataset/test --min-f1 0.78 > /tmp/wlp_test_output.txt
+          cat /tmp/wlp_test_output.txt
+          diff -u demo/output.txt /tmp/wlp_test_output.txt
+
   acoustic:
     runs-on: ubuntu-latest
     steps:
@@ -41,4 +44,28 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r acoustic/requirements.txt
-      - run: python -m pytest -q
+      - run: python -m pytest -p no:cacheprovider -v
+
+  lean:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache elan toolchain (Lean 4.36.0)
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: elan-${{ runner.os }}-${{ hashFiles('lean/lean-toolchain') }}
+      - name: Install elan and Lean 4.36.0 toolchain
+        run: |
+          if [ ! -x "$HOME/.elan/bin/lake" ]; then
+            curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install "$(cat lean/lean-toolchain)"
+      - name: Build LabEarsLean and verify theorem axioms (#print axioms)
+        run: |
+          cd lean && lake build && cd ..
+          python scripts/verify_lean_axioms.py

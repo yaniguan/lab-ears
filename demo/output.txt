@@ -1,6 +1,6 @@
 protocols: 125 (discontinuous_gold: 2, skipped_discontinuous: 0)
 label           gold  pred  P_exact  R_exact F1_exact  P_overlap  R_overlap F1_overlap
-Amount          1013  1132    0.756    0.845    0.798      0.777      0.869      0.821
-Temperature      509   583    0.799    0.916    0.853      0.851      0.974      0.908
+Amount          1013  1121    0.764    0.845    0.802      0.779      0.862      0.818
+Temperature      509   583    0.806    0.923    0.861      0.851      0.974      0.908
 Time             812   801    0.915    0.903    0.909      0.944      0.931      0.937
 Speed            155   146    0.863    0.813    0.837      0.932      0.877      0.904
