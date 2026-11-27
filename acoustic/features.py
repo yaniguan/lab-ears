@@ -239,6 +239,31 @@ def log_mel(x: np.ndarray, drop_speech_band: bool = False, *, pad_end: bool = Tr
     return mel.astype(np.float32, copy=False)
 
 
+def slice_wav_chunks(
+    wav: np.ndarray,
+    window_s: float,
+    hop_s: float,
+    *,
+    sr: int = SR,
+) -> List[np.ndarray]:
+    """Slice a 1D waveform into causal windows of `window_s` seconds every `hop_s` seconds."""
+    if window_s <= 0.0 or hop_s <= 0.0 or not (math.isfinite(window_s) and math.isfinite(hop_s)):
+        raise ValueError(f"window_s ({window_s}) and hop_s ({hop_s}) must be finite and > 0")
+    if sr <= 0:
+        raise ValueError(f"sr must be > 0, got {sr!r}")
+    arr = np.asarray(wav, dtype=np.float32).ravel()
+    if arr.size == 0:
+        raise ValueError("Cannot slice empty waveform")
+    win_n = max(1, int(round(window_s * sr)))
+    hop_n = max(1, int(round(hop_s * sr)))
+    if arr.size <= win_n:
+        return [arr]
+    starts = list(range(0, arr.size - win_n + 1, hop_n))
+    if starts[-1] != arr.size - win_n:
+        starts.append(arr.size - win_n)
+    return [arr[s : s + win_n] for s in starts]
+
+
 def mel_windows(mel: np.ndarray, window_frames: int = 64, hop_frames: int = 32) -> List[np.ndarray]:
     """Slice causal temporal sub-windows from a 2D mel spectrogram without dropping tail frames."""
     if window_frames < 1 or hop_frames < 1:

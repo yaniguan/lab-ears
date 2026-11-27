@@ -254,3 +254,105 @@ def test_issue32_audio_event_privacy_unification_and_fault_halts() -> None:
         == "L2_SPEECH_PRIVACY_BLOCK"
     )
 
+
+def test_issue39_fail_closed_privacy_fields_default_mel_bands_and_warn_defaults(tmp_path: Path) -> None:
+    import numpy as np
+    from scipy.io import wavfile
+    from acoustic.detect import GaussianDetector, calibrate_threshold
+    from acoustic.features import SR, log_mel, retained_mel_bands_hz
+    from acoustic.monitor import monitor_clip
+
+    # 1. Default retained bands match retained_mel_bands_hz(drop_speech_band=True)
+    assert autolab_wire.DEFAULT_RETAINED_BANDS_HZ == retained_mel_bands_hz(drop_speech_band=True)
+
+    # 2. Attached audio_events dict without privacy fields fails closed with missing-field detail
+    out_missing_all = process_packet(
+        {
+            "goal_text": "Spin at 500 x g for 5 min.",
+            "audio_events": [{"score": 1.0, "threshold": 2.0, "detector": "gaussian", "step": 0}],
+        }
+    )
+    assert out_missing_all["halted"] is True
+    assert out_missing_all["halt_reason"] == "L2_SPEECH_PRIVACY_BLOCK"
+    assert out_missing_all["speech_band_dropped"] is False
+    summary_all = out_missing_all["trace"][-1]["summary"]
+    for field_name in ("speech_band_dropped", "raw_audio_saved", "retained_bands_hz"):
+        assert field_name in summary_all
+
+    # Check each missing privacy field individually on both audio_events and interlock_decision
+    complete_event = {
+        "score": 1.0,
+        "threshold": 2.0,
+        "detector": "gaussian",
+        "step": 0,
+        "speech_band_dropped": True,
+        "raw_audio_saved": False,
+        "retained_bands_hz": retained_mel_bands_hz(drop_speech_band=True),
+    }
+    for omitted in ("speech_band_dropped", "raw_audio_saved", "retained_bands_hz"):
+        partial_ev = {k: v for k, v in complete_event.items() if k != omitted}
+        out_p = process_packet({"goal_text": "Add 100 uL at 25 C for 5 min.", "audio_events": [partial_ev]})
+        assert out_p["halted"] is True
+        assert out_p["halt_reason"] == "L2_SPEECH_PRIVACY_BLOCK"
+        assert omitted in out_p["trace"][-1]["summary"]
+
+    complete_interlock = {
+        "step_index": 1,
+        "halt_run": False,
+        "cavitation_ratio": 0.8,
+        "stall_ratio": 0.7,
+        "score": 0.4,
+        "speech_band_dropped": True,
+        "raw_audio_saved": False,
+        "retained_bands_hz": [[60, 260], [3600, 7800]],
+    }
+    for omitted in ("speech_band_dropped", "raw_audio_saved", "retained_bands_hz"):
+        partial_il = {k: v for k, v in complete_interlock.items() if k != omitted}
+        out_il = process_packet({"goal_text": "Add 100 uL at 25 C for 5 min.", "interlock_decision": partial_il})
+        assert out_il["halted"] is True
+        assert out_il["halt_reason"] == "L2_SPEECH_PRIVACY_BLOCK"
+        assert omitted in out_il["trace"][-1]["summary"]
+
+    # raw_audio_kept=False satisfies the raw-audio privacy declaration when raw_audio_saved is omitted
+    kept_only_ev = {k: v for k, v in complete_event.items() if k != "raw_audio_saved"}
+    kept_only_ev["raw_audio_kept"] = False
+    out_kept_ok = process_packet({"goal_text": "Add 100 uL at 25 C for 5 min.", "audio_events": [kept_only_ev]})
+    assert out_kept_ok["halted"] is False
+    assert out_kept_ok["trace"][-1]["status"] == "PASS"
+
+    # 3. Real monitor_clip() AudioEvent (and its JSON serialization) passes cleanly
+    rng = np.random.default_rng(39)
+    train_mels = [log_mel(0.02 * rng.standard_normal(SR).astype(np.float32), drop_speech_band=True) for _ in range(6)]
+    det = GaussianDetector().fit(train_mels)
+    thr = calibrate_threshold(det, train_mels, quantile=0.99)
+    step_wav = tmp_path / "step0.wav"
+    wavfile.write(step_wav, SR, (0.02 * rng.standard_normal(SR)).astype(np.float32))
+    real_ev = monitor_clip(
+        step_wav,
+        det,
+        threshold=thr + 5.0,
+        protocol_id="wire-test",
+        step=0,
+        instrument_id="centrifuge-01",
+    )
+    out_real = process_packet(
+        {
+            "goal_text": "Transfer 100 uL sample, incubate at 37 C for 10 min.",
+            "audio_events": [real_ev, real_ev.to_json()],
+        }
+    )
+    assert out_real["halted"] is False
+    assert out_real["speech_band_dropped"] is True
+    assert out_real["defaults_only"] is False
+    assert out_real["trace"][-1]["status"] == "PASS"
+
+    # 4. Packet with no parsed quantities is reported as WARN with defaults_only=True, never plain PASS
+    out_no_qty = process_packet({"goal_text": "Mix the sample gently and transfer to a new tube."})
+    assert out_no_qty["halted"] is False
+    assert out_no_qty["defaults_only"] is True
+    assert out_no_qty["parsed_spans"]["defaults_only"] is True
+    assert set(out_no_qty["parsed_spans"]["defaults_applied"]) == {"volume_ul", "temp_c", "duration_min"}
+    assert out_no_qty["trace"][-1]["status"] == "WARN"
+    assert out_no_qty["trace"][-1]["status"] != "PASS"
+
+

@@ -1,0 +1,541 @@
+{
+  "dataset": "Wet Lab Protocols (WLP, Kulkarni et al. NAACL 2018, commit 1f51ae6e620a5aa3590acf725713f430783f56d7)",
+  "zero_leakage_protocol": "LinearChainSpanTagger vocabulary and PA-II weights fit strictly on WLP/train (374 protocols); hyperparameters selected strictly on WLP/dev (123 protocols); WLP/test (125 protocols) evaluated once with SHA-256 zero-overlap verification. By contrast, rule_based regex patterns were previously refined with WLP/test errors visible.",
+  "selected_hyperparameters": {
+    "c_pa": 0.25,
+    "fn_cost": 1.3,
+    "epochs": 14,
+    "min_feature_freq": 1,
+    "seed": 42,
+    "n_features": 273555,
+    "fit_s": 139.13
+  },
+  "dev_hyperparameter_search": [
+    {
+      "c_pa": 0.15,
+      "fn_cost": 1.4,
+      "epochs": 12,
+      "fit_s": 47.0,
+      "dev_micro_f1_exact": 0.8775,
+      "dev_micro_f1_overlap": 0.9064
+    },
+    {
+      "c_pa": 0.25,
+      "fn_cost": 1.3,
+      "epochs": 14,
+      "fit_s": 45.81,
+      "dev_micro_f1_exact": 0.8779,
+      "dev_micro_f1_overlap": 0.9081
+    },
+    {
+      "c_pa": 0.35,
+      "fn_cost": 1.15,
+      "epochs": 14,
+      "fit_s": 39.24,
+      "dev_micro_f1_exact": 0.8746,
+      "dev_micro_f1_overlap": 0.9061
+    }
+  ],
+  "learned_bioes_pa2": {
+    "train": {
+      "protocols": 374,
+      "metrics": {
+        "Amount": {
+          "gold": 2814,
+          "pred": 2885,
+          "P_exact": 0.9276,
+          "R_exact": 0.951,
+          "F1_exact": 0.9391,
+          "P_overlap": 0.9376,
+          "R_overlap": 0.9613,
+          "F1_overlap": 0.9493
+        },
+        "Temperature": {
+          "gold": 1400,
+          "pred": 1478,
+          "P_exact": 0.9053,
+          "R_exact": 0.9557,
+          "F1_exact": 0.9298,
+          "P_overlap": 0.9188,
+          "R_overlap": 0.97,
+          "F1_overlap": 0.9437
+        },
+        "Time": {
+          "gold": 2100,
+          "pred": 2176,
+          "P_exact": 0.9416,
+          "R_exact": 0.9757,
+          "F1_exact": 0.9584,
+          "P_overlap": 0.9517,
+          "R_overlap": 0.9862,
+          "F1_overlap": 0.9687
+        },
+        "Speed": {
+          "gold": 591,
+          "pred": 598,
+          "P_exact": 0.9632,
+          "R_exact": 0.9746,
+          "F1_exact": 0.9689,
+          "P_overlap": 0.9749,
+          "R_overlap": 0.9865,
+          "F1_overlap": 0.9807
+        }
+      },
+      "micro": {
+        "gold": 6905,
+        "pred": 7137,
+        "P_exact": 0.9302,
+        "R_exact": 0.9615,
+        "F1_exact": 0.9456,
+        "P_overlap": 0.9412,
+        "R_overlap": 0.9728,
+        "F1_overlap": 0.9567
+      },
+      "upstream_text_sha256_duplicates": 374,
+      "unseen_text_protocols": 0,
+      "unseen_text_micro_f1_exact": 0.0,
+      "unseen_text_micro_f1_overlap": 0.0
+    },
+    "dev": {
+      "protocols": 123,
+      "metrics": {
+        "Amount": {
+          "gold": 977,
+          "pred": 941,
+          "P_exact": 0.847,
+          "R_exact": 0.8158,
+          "F1_exact": 0.8311,
+          "P_overlap": 0.8789,
+          "R_overlap": 0.8465,
+          "F1_overlap": 0.8624
+        },
+        "Temperature": {
+          "gold": 460,
+          "pred": 470,
+          "P_exact": 0.9085,
+          "R_exact": 0.9283,
+          "F1_exact": 0.9183,
+          "P_overlap": 0.9277,
+          "R_overlap": 0.9478,
+          "F1_overlap": 0.9376
+        },
+        "Time": {
+          "gold": 679,
+          "pred": 680,
+          "P_exact": 0.925,
+          "R_exact": 0.9264,
+          "F1_exact": 0.9257,
+          "P_overlap": 0.9515,
+          "R_overlap": 0.9529,
+          "F1_overlap": 0.9522
+        },
+        "Speed": {
+          "gold": 215,
+          "pred": 212,
+          "P_exact": 0.8538,
+          "R_exact": 0.8419,
+          "F1_exact": 0.8478,
+          "P_overlap": 0.9151,
+          "R_overlap": 0.9023,
+          "F1_overlap": 0.9087
+        }
+      },
+      "micro": {
+        "gold": 2331,
+        "pred": 2303,
+        "P_exact": 0.8832,
+        "R_exact": 0.8726,
+        "F1_exact": 0.8779,
+        "P_overlap": 0.9136,
+        "R_overlap": 0.9026,
+        "F1_overlap": 0.9081
+      },
+      "upstream_text_sha256_duplicates": 2,
+      "unseen_text_protocols": 121,
+      "unseen_text_micro_f1_exact": 0.8773,
+      "unseen_text_micro_f1_overlap": 0.9078
+    },
+    "test": {
+      "protocols": 125,
+      "metrics": {
+        "Amount": {
+          "gold": 1013,
+          "pred": 1036,
+          "P_exact": 0.8108,
+          "R_exact": 0.8292,
+          "F1_exact": 0.8199,
+          "P_overlap": 0.8224,
+          "R_overlap": 0.8411,
+          "F1_overlap": 0.8316
+        },
+        "Temperature": {
+          "gold": 509,
+          "pred": 507,
+          "P_exact": 0.9152,
+          "R_exact": 0.9116,
+          "F1_exact": 0.9134,
+          "P_overlap": 0.9408,
+          "R_overlap": 0.9371,
+          "F1_overlap": 0.939
+        },
+        "Time": {
+          "gold": 812,
+          "pred": 790,
+          "P_exact": 0.9291,
+          "R_exact": 0.9039,
+          "F1_exact": 0.9164,
+          "P_overlap": 0.9595,
+          "R_overlap": 0.9335,
+          "F1_overlap": 0.9463
+        },
+        "Speed": {
+          "gold": 155,
+          "pred": 166,
+          "P_exact": 0.8855,
+          "R_exact": 0.9484,
+          "F1_exact": 0.9159,
+          "P_overlap": 0.9096,
+          "R_overlap": 0.9742,
+          "F1_overlap": 0.9408
+        }
+      },
+      "micro": {
+        "gold": 2489,
+        "pred": 2499,
+        "P_exact": 0.8743,
+        "R_exact": 0.8779,
+        "F1_exact": 0.8761,
+        "P_overlap": 0.8956,
+        "R_overlap": 0.8992,
+        "F1_overlap": 0.8974
+      },
+      "upstream_text_sha256_duplicates": 4,
+      "unseen_text_protocols": 121,
+      "unseen_text_micro_f1_exact": 0.8751,
+      "unseen_text_micro_f1_overlap": 0.8965
+    },
+    "pooled_622": {
+      "protocols": 622,
+      "metrics": {
+        "Amount": {
+          "gold": 4804,
+          "pred": 4862,
+          "P_exact": 0.8871,
+          "R_exact": 0.8978,
+          "F1_exact": 0.8924,
+          "P_overlap": 0.9017,
+          "R_overlap": 0.9126,
+          "F1_overlap": 0.9071
+        },
+        "Temperature": {
+          "gold": 2369,
+          "pred": 2455,
+          "P_exact": 0.9079,
+          "R_exact": 0.9409,
+          "F1_exact": 0.9241,
+          "P_overlap": 0.9251,
+          "R_overlap": 0.9586,
+          "F1_overlap": 0.9415
+        },
+        "Time": {
+          "gold": 3591,
+          "pred": 3646,
+          "P_exact": 0.9358,
+          "R_exact": 0.9502,
+          "F1_exact": 0.9429,
+          "P_overlap": 0.9534,
+          "R_overlap": 0.968,
+          "F1_overlap": 0.9606
+        },
+        "Speed": {
+          "gold": 961,
+          "pred": 976,
+          "P_exact": 0.9262,
+          "R_exact": 0.9407,
+          "F1_exact": 0.9334,
+          "P_overlap": 0.9508,
+          "R_overlap": 0.9657,
+          "F1_overlap": 0.9582
+        }
+      },
+      "micro": {
+        "gold": 11725,
+        "pred": 11939,
+        "P_exact": 0.9095,
+        "R_exact": 0.9261,
+        "F1_exact": 0.9177,
+        "P_overlap": 0.9263,
+        "R_overlap": 0.9432,
+        "F1_overlap": 0.9347
+      }
+    }
+  },
+  "rule_based_regex": {
+    "train": {
+      "protocols": 374,
+      "metrics": {
+        "Amount": {
+          "gold": 2814,
+          "pred": 3339,
+          "P_exact": 0.7107,
+          "R_exact": 0.8433,
+          "F1_exact": 0.7713,
+          "P_overlap": 0.7376,
+          "R_overlap": 0.8753,
+          "F1_overlap": 0.8006
+        },
+        "Temperature": {
+          "gold": 1400,
+          "pred": 1775,
+          "P_exact": 0.7031,
+          "R_exact": 0.8914,
+          "F1_exact": 0.7861,
+          "P_overlap": 0.7437,
+          "R_overlap": 0.9429,
+          "F1_overlap": 0.8315
+        },
+        "Time": {
+          "gold": 2100,
+          "pred": 2199,
+          "P_exact": 0.844,
+          "R_exact": 0.8838,
+          "F1_exact": 0.8635,
+          "P_overlap": 0.884,
+          "R_overlap": 0.9257,
+          "F1_overlap": 0.9044
+        },
+        "Speed": {
+          "gold": 591,
+          "pred": 536,
+          "P_exact": 0.8862,
+          "R_exact": 0.8037,
+          "F1_exact": 0.8429,
+          "P_overlap": 0.9403,
+          "R_overlap": 0.8528,
+          "F1_overlap": 0.8944
+        }
+      },
+      "micro": {
+        "gold": 6905,
+        "pred": 7849,
+        "P_exact": 0.7583,
+        "R_exact": 0.862,
+        "F1_exact": 0.8068,
+        "P_overlap": 0.7939,
+        "R_overlap": 0.9024,
+        "F1_overlap": 0.8447
+      }
+    },
+    "dev": {
+      "protocols": 123,
+      "metrics": {
+        "Amount": {
+          "gold": 977,
+          "pred": 1074,
+          "P_exact": 0.7663,
+          "R_exact": 0.8424,
+          "F1_exact": 0.8025,
+          "P_overlap": 0.8026,
+          "R_overlap": 0.8823,
+          "F1_overlap": 0.8406
+        },
+        "Temperature": {
+          "gold": 460,
+          "pred": 571,
+          "P_exact": 0.7688,
+          "R_exact": 0.9543,
+          "F1_exact": 0.8516,
+          "P_overlap": 0.7951,
+          "R_overlap": 0.987,
+          "F1_overlap": 0.8807
+        },
+        "Time": {
+          "gold": 679,
+          "pred": 688,
+          "P_exact": 0.8983,
+          "R_exact": 0.9102,
+          "F1_exact": 0.9042,
+          "P_overlap": 0.9273,
+          "R_overlap": 0.9396,
+          "F1_overlap": 0.9334
+        },
+        "Speed": {
+          "gold": 215,
+          "pred": 213,
+          "P_exact": 0.8216,
+          "R_exact": 0.814,
+          "F1_exact": 0.8178,
+          "P_overlap": 0.9014,
+          "R_overlap": 0.893,
+          "F1_overlap": 0.8972
+        }
+      },
+      "micro": {
+        "gold": 2331,
+        "pred": 2546,
+        "P_exact": 0.8071,
+        "R_exact": 0.8816,
+        "F1_exact": 0.8427,
+        "P_overlap": 0.8429,
+        "R_overlap": 0.9206,
+        "F1_overlap": 0.88
+      }
+    },
+    "test": {
+      "protocols": 125,
+      "metrics": {
+        "Amount": {
+          "gold": 1013,
+          "pred": 1121,
+          "P_exact": 0.7636,
+          "R_exact": 0.845,
+          "F1_exact": 0.8022,
+          "P_overlap": 0.7788,
+          "R_overlap": 0.8618,
+          "F1_overlap": 0.8182
+        },
+        "Temperature": {
+          "gold": 509,
+          "pred": 583,
+          "P_exact": 0.8062,
+          "R_exact": 0.9234,
+          "F1_exact": 0.8608,
+          "P_overlap": 0.8508,
+          "R_overlap": 0.9745,
+          "F1_overlap": 0.9084
+        },
+        "Time": {
+          "gold": 812,
+          "pred": 801,
+          "P_exact": 0.9151,
+          "R_exact": 0.9027,
+          "F1_exact": 0.9089,
+          "P_overlap": 0.9438,
+          "R_overlap": 0.931,
+          "F1_overlap": 0.9374
+        },
+        "Speed": {
+          "gold": 155,
+          "pred": 146,
+          "P_exact": 0.863,
+          "R_exact": 0.8129,
+          "F1_exact": 0.8372,
+          "P_overlap": 0.9315,
+          "R_overlap": 0.8774,
+          "F1_overlap": 0.9037
+        }
+      },
+      "micro": {
+        "gold": 2489,
+        "pred": 2651,
+        "P_exact": 0.8242,
+        "R_exact": 0.8779,
+        "F1_exact": 0.8502,
+        "P_overlap": 0.8529,
+        "R_overlap": 0.9084,
+        "F1_overlap": 0.8798
+      }
+    },
+    "pooled_622": {
+      "protocols": 622,
+      "metrics": {
+        "Amount": {
+          "gold": 4804,
+          "pred": 5534,
+          "P_exact": 0.7322,
+          "R_exact": 0.8435,
+          "F1_exact": 0.7839,
+          "P_overlap": 0.7586,
+          "R_overlap": 0.8739,
+          "F1_overlap": 0.8121
+        },
+        "Temperature": {
+          "gold": 2369,
+          "pred": 2929,
+          "P_exact": 0.7364,
+          "R_exact": 0.9105,
+          "F1_exact": 0.8143,
+          "P_overlap": 0.775,
+          "R_overlap": 0.9582,
+          "F1_overlap": 0.8569
+        },
+        "Time": {
+          "gold": 3591,
+          "pred": 3688,
+          "P_exact": 0.8696,
+          "R_exact": 0.8931,
+          "F1_exact": 0.8812,
+          "P_overlap": 0.9051,
+          "R_overlap": 0.9295,
+          "F1_overlap": 0.9172
+        },
+        "Speed": {
+          "gold": 961,
+          "pred": 895,
+          "P_exact": 0.867,
+          "R_exact": 0.8075,
+          "F1_exact": 0.8362,
+          "P_overlap": 0.9296,
+          "R_overlap": 0.8658,
+          "F1_overlap": 0.8966
+        }
+      },
+      "micro": {
+        "gold": 11725,
+        "pred": 13046,
+        "P_exact": 0.7812,
+        "R_exact": 0.8693,
+        "F1_exact": 0.8229,
+        "P_overlap": 0.8154,
+        "R_overlap": 0.9073,
+        "F1_overlap": 0.8589
+      }
+    }
+  },
+  "external_transfer": [
+    {
+      "dataset_id": "bioprobench",
+      "n_protocols": 1200,
+      "protocols_with_learned_spans": 720,
+      "protocols_with_rule_spans": 777,
+      "learned_total_spans": 1495,
+      "rule_total_spans": 1689,
+      "learned_spans_by_label": {
+        "Amount": 607,
+        "Temperature": 356,
+        "Time": 419,
+        "Speed": 113
+      },
+      "rule_spans_by_label": {
+        "Amount": 756,
+        "Temperature": 396,
+        "Time": 440,
+        "Speed": 97
+      },
+      "cross_extractor_f1_exact": 0.8712,
+      "cross_extractor_f1_overlap": 0.8775
+    },
+    {
+      "dataset_id": "bioplanner_bioprot",
+      "n_protocols": 8,
+      "protocols_with_learned_spans": 8,
+      "protocols_with_rule_spans": 8,
+      "learned_total_spans": 107,
+      "rule_total_spans": 129,
+      "learned_spans_by_label": {
+        "Amount": 46,
+        "Temperature": 20,
+        "Time": 34,
+        "Speed": 7
+      },
+      "rule_spans_by_label": {
+        "Amount": 54,
+        "Temperature": 28,
+        "Time": 41,
+        "Speed": 6
+      },
+      "cross_extractor_f1_exact": 0.8814,
+      "cross_extractor_f1_overlap": 0.8898
+    }
+  ]
+}

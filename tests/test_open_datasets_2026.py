@@ -471,13 +471,12 @@ def test_fetch_open_datasets_cli_security_and_commercial_gate(tmp_path: Path, ca
 
 def test_pure_english_zero_cjk_in_new_files_and_docs() -> None:
     cjk_re = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
-    checked_paths = [
-        REPO_ROOT / "acoustic" / "open_datasets.py",
-        REPO_ROOT / "scripts" / "fetch_open_datasets.py",
-        REPO_ROOT / "tests" / "test_open_datasets_2026.py",
-        REPO_ROOT / "README.md",
-        REPO_ROOT / "docs" / "ARCHITECTURE_AND_HISTORY.md",
-    ]
-    for path in checked_paths:
+    exts = {".py", ".md", ".lean", ".toml", ".txt", ".json", ".yml", ".yaml"}
+    skip_dirs = {".git", "data", "__pycache__", ".pytest_cache", ".lake", ".venv", "venv"}
+    for path in sorted(REPO_ROOT.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in exts:
+            continue
+        if any(part in skip_dirs for part in path.relative_to(REPO_ROOT).parts):
+            continue
         text = path.read_text(encoding="utf-8")
         assert cjk_re.search(text) is None, f"CJK character detected in {path}"
